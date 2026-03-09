@@ -1,0 +1,28 @@
+# ===== Build / Install / Log =====
+build/
+install/
+log/
+
+# ===== Python =====
+__pycache__/
+*.pyc
+*.pyo
+
+# ===== C/C++ =====
+*.o
+*.out
+*.so
+*.a
+
+# ===== IDE / Editor =====
+.vscode/
+.idea/
+*.swp
+
+# ===== OS =====
+.DS_Store
+Thumbs.db
+
+# ===== ROS2 Package Setup =====
+setup.cfg
+setup.py
