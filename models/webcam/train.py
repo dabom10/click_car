@@ -1,7 +1,7 @@
 from ultralytics import YOLO
 
 # 모델 로드 (nano/small/medium/large/xlarge)
-model = YOLO("yolov8n.pt")  # n → s → m → l → x 순으로 무거워짐
+model = YOLO("yolo26n.pt")  # n → s → m → l → x 순으로 무거워짐
 
 # 학습
 results = model.train(
@@ -14,7 +14,7 @@ results = model.train(
     workers=4,
     device=0,            # GPU 없으면 device="cpu"
     project="/home/rokey/click_car/models/webcam",
-    name="v2",
+    name="v4",
     
     # ── Optimizer ──────────────────────────
     optimizer="Adam",     # SGD / Adam / AdamW
