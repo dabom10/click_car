@@ -46,9 +46,9 @@ from firebase_admin import credentials, db
 # ================================
 # 설정 상수
 # ================================
-MODEL_PATH         = "/home/ubuntu/click_car/yolov8n.pt"
-FIREBASE_CRED_PATH = "/home/ubuntu/click_car/web/database.json"
-FIREBASE_DB_URL    = "https://console.firebase.google.com/project/click-car-2f586/database/click-car-2f586-default-rtdb/data/~2F"  # Realtime DB URL
+MODEL_PATH         = "/home/rokey/click_car/yolov8n.pt"
+FIREBASE_CRED_PATH = "/home/rokey/click_car/web/database.json"
+FIREBASE_DB_URL    = "https://click-car-2f586-default-rtdb.firebaseio.com"  # Realtime DB URL
 
 CONF_THRESHOLD        = 0.25   # YOLO 추론 기본 confidence
 DETECT_CONF_THRESHOLD = 0.50   # DB 저장 트리거 confidence
@@ -62,6 +62,8 @@ DISPLAY_PERIOD_SEC = 0.05
 GUI_WINDOW_NAME = "AMR Plate Detection"
 GUI_WIDTH       = 640
 GUI_HEIGHT      = 480
+
+ROBOT_NAMESPACE = "/robot2"   # 로봇 네임스페이스 변경: /robot2 또는 /robot3
 # ================================
 
 
@@ -78,8 +80,7 @@ class PlateDetectionNode(Node):
         self.save_queue = queue.Queue()
 
         # 네임스페이스 기반 토픽
-        ns = self.get_namespace()
-        self.rgb_topic = f"{ns}/oakd/rgb/image_raw/compressed"
+        self.rgb_topic = f"{ROBOT_NAMESPACE}/oakd/rgb/image_raw/compressed"
 
         self.get_logger().info(f"RGB topic  : {self.rgb_topic}")
         self.get_logger().info(f"YOLO model : {MODEL_PATH}")
