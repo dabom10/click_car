@@ -5,7 +5,7 @@ model = YOLO("yolov8n.pt")  # n → s → m → l → x 순으로 무거워짐
 
 # 학습
 results = model.train(
-    data="/home/rokey/click_car/models/webcam/dataset/argu_yes/data.yaml",
+    data="/home/rokey/click_car/models/webcam/dataset/argu_no/data.yaml",
     
     # ── 기본 설정 ──────────────────────────
     epochs=100,
