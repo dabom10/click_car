@@ -1,33 +1,33 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-plate_detection_node.py
------------------------
+detect.py
+---------
 단속봇(AMR) OAK-D 카메라 영상을 구독하여 YOLO 모델로
 'car' → 'id'(번호판) 2단계 탐지를 수행하고,
-car bbox 안에서 id가 감지되면 크롭 이미지를 Firebase에 저장하는 ROS2 노드.
-
-※ 로봇 변경 시 ROBOT_NAMESPACE 상수만 수정
-   AMR 1번 (단속봇) : ROBOT_NAMESPACE = "robot3"
-   AMR 2번 (순찰봇) : ROBOT_NAMESPACE = "robot2"
+car bbox 안에서 id가 감지되면 번호판 크롭 이미지를
+Base64 인코딩하여 Firebase Realtime Database에 저장하는 ROS2 노드.
 
 탐지 흐름:
   1. 매 프레임 YOLO 추론 → 'car' 클래스 감지
   2. 감지된 car bbox 안에 'id' bbox가 겹치는지 확인
-  3. 조건 충족 시 번호판(id) 크롭 이미지를 Firebase Storage / Firestore에 저장
+  3. 조건 충족 시 번호판 크롭 이미지를 Base64로 Realtime DB에 저장
 
 스레드 구조:
-  - ROS spin 스레드 : 카메라 수신 + YOLO 탐지 (실시간성 보장)
-  - Firebase 스레드 : 저장 I/O만 분리 (탐지 블로킹 방지)
+  - ROS spin      : 카메라 수신 + YOLO 탐지 (실시간성 보장)
+  - Firebase 워커 : 저장 I/O만 분리 (탐지 블로킹 방지)
 
 토픽:
-  Subscribe : /{ROBOT_NAMESPACE}/oakd/rgb/image_raw/compressed  (sensor_msgs/CompressedImage)
+  Subscribe : /{ns}/oakd/rgb/image_raw/compressed  (sensor_msgs/CompressedImage)
 
-Firebase:
-  Storage  : detections/{timestamp}.jpg  (번호판 크롭 이미지)
-  Firestore: detections/{doc_id}         (메타데이터: 시각, confidence, bbox, image_url)
+Firebase Realtime DB 구조:
+  detections/{timestamp} : {
+      detected_at, car_confidence, id_confidence,
+      car_bbox, id_bbox, image_base64
+  }
 """
 
+import base64
 import datetime
 import queue
 import threading
@@ -40,32 +40,26 @@ from sensor_msgs.msg import CompressedImage
 from ultralytics import YOLO
 
 import firebase_admin
-from firebase_admin import credentials, firestore, storage
+from firebase_admin import credentials, db
 
 
 # ================================
 # 설정 상수
 # ================================
+MODEL_PATH         = "/home/ubuntu/click_car/yolov8n.pt"
+FIREBASE_CRED_PATH = "/home/ubuntu/click_car/web/database.json"
+FIREBASE_DB_URL    = "https://console.firebase.google.com/project/click-car-2f586/database/click-car-2f586-default-rtdb/data/~2F"  # Realtime DB URL
 
-# ▼ 로봇 변경 시 이 값만 수정 ▼
-# AMR 1번 (단속봇): "robot3"
-# AMR 2번 (순찰봇): "robot2"
-ROBOT_NAMESPACE = "robot2"
-
-MODEL_PATH            = "/home/rokey/click_car/models/AMR/v1/weights/best.pt"
 CONF_THRESHOLD        = 0.25   # YOLO 추론 기본 confidence
-DETECT_CONF_THRESHOLD = 0.50   # Firebase 저장 트리거 confidence
+DETECT_CONF_THRESHOLD = 0.50   # DB 저장 트리거 confidence
 
-FIREBASE_CRED_PATH   = "/home/rokey/click_car/web/database.json"
-FIREBASE_BUCKET_NAME = "click-car-2f586.appspot.com"
-
-# car bbox 안에 id bbox가 겹치는 비율 기준 (id 기준 overlap)
+# id bbox 가 car bbox 안에 포함되는 비율 기준
 ID_IN_CAR_OVERLAP_THRESH = 0.5
 
 YOLO_PERIOD_SEC    = 0.12
 DISPLAY_PERIOD_SEC = 0.05
 
-GUI_WINDOW_NAME = f"Plate Detection [{ROBOT_NAMESPACE}]"
+GUI_WINDOW_NAME = "AMR Plate Detection"
 GUI_WIDTH       = 640
 GUI_HEIGHT      = 480
 # ================================
@@ -80,13 +74,13 @@ class PlateDetectionNode(Node):
         self.last_detections  = []
         self.logged_rgb_shape = False
 
-        # Firebase 저장 큐 (탐지 스레드 → 저장 스레드)
+        # DB 저장 큐 (탐지 → 저장 스레드)
         self.save_queue = queue.Queue()
 
-        # 네임스페이스 상수로 고정
-        self.rgb_topic = f"/{ROBOT_NAMESPACE}/oakd/rgb/image_raw/compressed"
+        # 네임스페이스 기반 토픽
+        ns = self.get_namespace()
+        self.rgb_topic = f"{ns}/oakd/rgb/image_raw/compressed"
 
-        self.get_logger().info(f"Robot NS   : {ROBOT_NAMESPACE}")
         self.get_logger().info(f"RGB topic  : {self.rgb_topic}")
         self.get_logger().info(f"YOLO model : {MODEL_PATH}")
 
@@ -95,12 +89,12 @@ class PlateDetectionNode(Node):
         self.model = YOLO(MODEL_PATH)
         self.get_logger().info("YOLO 모델 로드 완료")
 
-        # Firebase 초기화
+        # Firebase Realtime DB 초기화
         self._init_firebase()
 
-        # Firebase 저장 전용 스레드 시작 (I/O 블로킹 격리)
+        # DB 저장 전용 워커 스레드
         self.save_thread = threading.Thread(
-            target=self._firebase_save_worker, daemon=True
+            target=self._db_save_worker, daemon=True
         )
         self.save_thread.start()
 
@@ -117,22 +111,20 @@ class PlateDetectionNode(Node):
         self.create_timer(YOLO_PERIOD_SEC,    self.run_detection_cycle)
         self.create_timer(DISPLAY_PERIOD_SEC, self.display_images)
 
-        self.get_logger().info(f"[{ROBOT_NAMESPACE}] 번호판 탐지 노드 시작 - 즉시 탐지 중...")
+        self.get_logger().info("번호판 탐지 노드 시작 - 즉시 탐지 중...")
 
     # ------------------------------------------------------------------
-    # Firebase 초기화
+    # Firebase Realtime DB 초기화
     # ------------------------------------------------------------------
     def _init_firebase(self):
         try:
             cred = credentials.Certificate(FIREBASE_CRED_PATH)
-            firebase_admin.initialize_app(cred, {"storageBucket": FIREBASE_BUCKET_NAME})
-            self.db_client      = firestore.client()
-            self.storage_bucket = storage.bucket()
-            self.get_logger().info("Firebase 초기화 성공")
+            firebase_admin.initialize_app(cred, {"databaseURL": FIREBASE_DB_URL})
+            self.db_ref = db.reference("detections")
+            self.get_logger().info("Firebase Realtime DB 초기화 성공")
         except Exception as e:
-            self.get_logger().error(f"Firebase 초기화 실패: {e}")
-            self.db_client      = None
-            self.storage_bucket = None
+            self.get_logger().error(f"Firebase Realtime DB 초기화 실패: {e}")
+            self.db_ref = None
 
     # ------------------------------------------------------------------
     # 카메라 콜백
@@ -187,7 +179,7 @@ class PlateDetectionNode(Node):
                 f"id_bbox=({id_det['x1']},{id_det['y1']},{id_det['x2']},{id_det['y2']})"
             )
 
-            # 저장 큐에 추가 (Firebase 저장 스레드가 처리)
+            # 저장 큐에 추가 (워커 스레드가 처리)
             self.save_queue.put({
                 "frame":   frame,
                 "car_det": matched_car,
@@ -241,8 +233,7 @@ class PlateDetectionNode(Node):
         """
         best_car     = None
         best_overlap = 0.0
-
-        id_area = max(1, id_det["area"])
+        id_area      = max(1, id_det["area"])
 
         for car in cars:
             ix1 = max(id_det["x1"], car["x1"])
@@ -250,11 +241,8 @@ class PlateDetectionNode(Node):
             ix2 = min(id_det["x2"], car["x2"])
             iy2 = min(id_det["y2"], car["y2"])
 
-            inter_w    = max(0, ix2 - ix1)
-            inter_h    = max(0, iy2 - iy1)
-            inter_area = inter_w * inter_h
-
-            overlap = inter_area / id_area
+            inter_area = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+            overlap    = inter_area / id_area
 
             if overlap >= ID_IN_CAR_OVERLAP_THRESH and overlap > best_overlap:
                 best_overlap = overlap
@@ -263,22 +251,22 @@ class PlateDetectionNode(Node):
         return best_car
 
     # ------------------------------------------------------------------
-    # Firebase 저장 전용 워커 스레드
+    # DB 저장 전용 워커 스레드
     # ------------------------------------------------------------------
-    def _firebase_save_worker(self):
+    def _db_save_worker(self):
         while True:
             try:
                 item = self.save_queue.get()
                 if item is None:  # 종료 신호
                     break
-                self._save_to_firebase(item["frame"], item["car_det"], item["id_det"])
+                self._save_to_realtime_db(item["frame"], item["car_det"], item["id_det"])
                 self.save_queue.task_done()
             except Exception as e:
                 self.get_logger().error(f"저장 워커 오류: {e}")
 
-    def _save_to_firebase(self, frame, car_det, id_det):
-        if self.db_client is None or self.storage_bucket is None:
-            self.get_logger().warn("Firebase 미초기화 - 저장 건너뜀")
+    def _save_to_realtime_db(self, frame, car_det, id_det):
+        if self.db_ref is None:
+            self.get_logger().warn("Firebase Realtime DB 미초기화 - 저장 건너뜀")
             return
         try:
             now       = datetime.datetime.now()
@@ -291,23 +279,16 @@ class PlateDetectionNode(Node):
                 self.get_logger().warn("번호판 크롭 영역이 비어 있음 - 저장 건너뜀")
                 return
 
-            # JPEG 인코딩
-            _, encoded  = cv2.imencode(".jpg", plate_crop)
-            image_bytes = encoded.tobytes()
+            # JPEG 인코딩 → Base64 변환
+            _, encoded   = cv2.imencode(".jpg", plate_crop)
+            image_base64 = base64.b64encode(encoded.tobytes()).decode("utf-8")
 
-            # Storage 업로드
-            blob_path = f"detections/{ROBOT_NAMESPACE}/{timestamp}.jpg"
-            blob      = self.storage_bucket.blob(blob_path)
-            blob.upload_from_string(image_bytes, content_type="image/jpeg")
-            blob.make_public()
-            image_url = blob.public_url
-
-            # Firestore 메타데이터 저장
+            # Realtime DB 저장
+            # 경로: detections/{timestamp}
             doc_data = {
-                "robot_namespace":  ROBOT_NAMESPACE,
-                "detected_at":      now.isoformat(),
-                "id_confidence":    round(id_det["conf"],  4),
-                "car_confidence":   round(car_det["conf"], 4),
+                "detected_at":    now.isoformat(),
+                "car_confidence": round(car_det["conf"], 4),
+                "id_confidence":  round(id_det["conf"],  4),
                 "car_bbox": {
                     "x1": car_det["x1"], "y1": car_det["y1"],
                     "x2": car_det["x2"], "y2": car_det["y2"],
@@ -315,19 +296,18 @@ class PlateDetectionNode(Node):
                     "height": car_det["y2"] - car_det["y1"],
                 },
                 "id_bbox": {
-                    "x1": x1,        "y1": y1,
-                    "x2": x2,        "y2": y2,
+                    "x1": x1, "y1": y1,
+                    "x2": x2, "y2": y2,
                     "width":  x2 - x1,
                     "height": y2 - y1,
                 },
-                "image_path": blob_path,
-                "image_url":  image_url,
+                "image_base64": image_base64,
             }
-            self.db_client.collection("detections").add(doc_data)
-            self.get_logger().info(f"Firebase 저장 완료: {blob_path}")
+            self.db_ref.child(timestamp).set(doc_data)
+            self.get_logger().info(f"Realtime DB 저장 완료: detections/{timestamp}")
 
         except Exception as e:
-            self.get_logger().error(f"Firebase 저장 실패: {e}")
+            self.get_logger().error(f"Realtime DB 저장 실패: {e}")
 
     # ------------------------------------------------------------------
     # GUI 표시 (타이머 콜백)
@@ -356,7 +336,7 @@ class PlateDetectionNode(Node):
     # 종료 처리
     # ------------------------------------------------------------------
     def destroy_node(self):
-        self.save_queue.put(None)  # 저장 워커 스레드 종료 신호
+        self.save_queue.put(None)  # 워커 스레드 종료 신호
         cv2.destroyAllWindows()
         super().destroy_node()
 
