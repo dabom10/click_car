@@ -57,7 +57,7 @@ CONF_THRESHOLD        = 0.25   # YOLO 추론 기본 confidence
 DETECT_CONF_THRESHOLD = 0.50   # Firebase 저장 트리거 confidence
 
 FIREBASE_CRED_PATH   = "/home/rokey/click_car/web/database.json"
-FIREBASE_BUCKET_NAME = "click-car-2f586.firebasestorage.app"
+FIREBASE_BUCKET_NAME = "click-car-2f586.appspot.com"
 
 # car bbox 안에 id bbox가 겹치는 비율 기준 (id 기준 overlap)
 ID_IN_CAR_OVERLAP_THRESH = 0.5
