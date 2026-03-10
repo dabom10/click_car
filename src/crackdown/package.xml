@@ -4,9 +4,12 @@
   <name>crackdown</name>
   <version>0.0.0</version>
   <description>TODO: Package description</description>
-  <maintainer email="kim71857465@gmail.com">kyb</maintainer>
+  <maintainer email="todo@todo.com"></maintainer>
   <license>TODO: License declaration</license>
 
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>irobot_create_msgs</exec_depend>
+  <exec_depend>builtin_interfaces</exec_depend>
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>
   <test_depend>ament_pep257</test_depend>
