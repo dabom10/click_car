@@ -5,15 +5,15 @@ model = YOLO("yolov8n.pt")  # n → s → m → l → x 순으로 무거워짐
 
 # 학습
 results = model.train(
-    data="/home/rokey/click_car/models/webcam/dataset/argu_no/data.yaml",
+    data="/home/rokey/click_car/models/AMR/dataset/argu_no/data.yaml",
     
     # ── 기본 설정 ──────────────────────────
     epochs=100,
     imgsz=640,
-    batch=16,            # GPU 메모리 부족 시 8로 낮추기
+    batch=32,            # GPU 메모리 부족 시 8로 낮추기
     workers=4,
     device=0,            # GPU 없으면 device="cpu"
-    project="/home/rokey/click_car/models/webcam",
+    project="/home/rokey/click_car/models/AMR",
     name="v2",
     
     # ── Optimizer ──────────────────────────
