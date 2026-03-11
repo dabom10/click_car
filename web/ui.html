@@ -1,47 +1,45 @@
 <!DOCTYPE html>
-<html>
+<html lang="ko">
 <head>
-<meta charset="UTF-8">
-<title>불법 주정차 단속 로봇 관리</title>
+    <meta charset="UTF-8">
+    <title>불법 주정차 단속 로봇 통합 관리</title>
 
-<style>
-body{
-    font-family: Arial;
-    margin:40px;
-    background:#f5f5f5;
-}
+    <style>
+        body { font-family: 'Segoe UI', Arial, sans-serif; margin: 40px; background: #f0f2f5; color: #333; }
+        h1 { text-align: center; color: #2c3e50; margin-bottom: 30px; }
+        
+        .section { background: white; padding: 25px; margin-bottom: 30px; border-radius: 12px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
+        h2 { border-left: 5px solid #3498db; padding-left: 15px; margin-top: 0; font-size: 1.2rem; margin-bottom: 20px; }
 
-h1{
-    text-align:center;
-}
+        /* 로봇 상태 위젯 */
+        .robot-container { display: flex; gap: 20px; }
+        .robot-card { flex: 1; background: #f8f9fa; border: 1px solid #e1e4e8; border-radius: 10px; padding: 15px; text-align: center; }
+        .battery-container { background: #ddd; border-radius: 5px; height: 18px; width: 100%; margin: 10px 0; position: relative; }
+        .battery-level { background: #27ae60; height: 100%; border-radius: 5px; transition: width 0.5s ease; }
+        .battery-text { position: absolute; width: 100%; top:0; left:0; font-size: 11px; line-height: 18px; color: black; font-weight: bold; }
 
-.section{
-    background:white;
-    padding:20px;
-    margin-bottom:30px;
-    border-radius:10px;
-}
+        /* 메인 웹캠 감지 칸 */
+        .webcam-box { display: flex; gap: 20px; align-items: center; background: #2c3e50; color: white; padding: 15px; border-radius: 10px; }
+        .webcam-img { width: 400px; height: 250px; background: #000; border-radius: 8px; object-fit: cover; border: 2px solid #555; }
+        .webcam-info { flex: 1; font-size: 1.1rem; line-height: 1.8; }
+        .webcam-info span { color: #f1c40f; font-weight: bold; }
 
-table{
-    width:100%;
-    border-collapse:collapse;
-}
+        /* 터틀봇 정밀 촬영 상세 */
+        .robot-detail { display: flex; gap: 30px; background: #fff8e1; padding: 20px; border: 2px dashed #f1c40f; border-radius: 10px; }
+        .plate-img-box { flex: 1; text-align: center; }
+        .plate-img-box img { width: 100%; max-width: 350px; border-radius: 5px; border: 3px solid #333; }
+        .plate-text-box { flex: 1; display: flex; flex-direction: column; justify-content: center; align-items: center; }
+        .plate-number { font-size: 3rem; font-weight: bold; letter-spacing: 5px; background: white; padding: 10px 30px; border: 4px solid #333; border-radius: 10px; box-shadow: 4px 4px 0px #aaa; }
 
-th, td{
-    border:1px solid #ddd;
-    padding:8px;
-}
+        /* 테이블 디자인 */
+        table { width: 100%; border-collapse: collapse; margin-top: 10px; }
+        th, td { border-bottom: 1px solid #eee; padding: 12px; text-align: left; }
+        th { background: #2c3e50; color: white; }
+        .status-badge { padding: 4px 8px; border-radius: 4px; font-size: 0.8rem; background: #e8f5e9; color: #2e7d32; }
+    </style>
 
-th{
-    background:#2c3e50;
-    color:white;
-}
-
-img{
-    width:120px;
-}
-</style>
-
+    <script src="https://www.gstatic.com/firebasejs/8.10.1/firebase-app.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/8.10.1/firebase-database.js"></script>
 </head>
 
 <body>
@@ -49,73 +47,128 @@ img{
 <h1>🚓 불법 주정차 단속 로봇 관리 시스템</h1>
 
 <div class="section">
-<h2>📷 차량 감지 기록</h2>
-
-<table>
-<tr>
-<th>ID</th>
-<th>사진</th>
-<th>감지 시간</th>
-<th>상태</th>
-</tr>
-
-<tr>
-<td>1</td>
-<td><img src="car1.jpg"></td>
-<td>2026-03-10 14:02</td>
-<td>waiting</td>
-</tr>
-
-</table>
+    <h2>🤖 실시간 로봇 상태</h2>
+    <div class="robot-container">
+        <div class="robot-card" id="robot1">
+            <strong>Turtlebot 4 - 01</strong>
+            <div class="battery-container">
+                <div id="bat1-bar" class="battery-level" style="width: 0%;"></div>
+                <div id="bat1-text" class="battery-text">0%</div>
+            </div>
+            <div style="font-size:0.9rem">위치: <span id="pos1">-</span></div>
+        </div>
+        <div class="robot-card" id="robot2">
+            <strong>Turtlebot 4 - 02</strong>
+            <div class="battery-container">
+                <div id="bat2-bar" class="battery-level" style="width: 0%;"></div>
+                <div id="bat2-text" class="battery-text">0%</div>
+            </div>
+            <div style="font-size:0.9rem">위치: <span id="pos2">-</span></div>
+        </div>
+    </div>
 </div>
-
 
 <div class="section">
-<h2>🤖 터틀봇 출동 로그</h2>
-
-<table>
-<tr>
-<th>ID</th>
-<th>Detection ID</th>
-<th>Robot</th>
-<th>출동 시간</th>
-<th>Status</th>
-</tr>
-
-<tr>
-<td>1</td>
-<td>1</td>
-<td>turtlebot4-01</td>
-<td>2026-03-10 14:05</td>
-<td>sent</td>
-</tr>
-
-</table>
+    <h2>🏢 메인 카메라(Webcam) 감지 현황</h2>
+    <div class="webcam-box">
+        <img id="main-cam-img" class="webcam-img" src="https://via.placeholder.com/400x250?text=Waiting+for+Signal">
+        <div class="webcam-info">
+            <p>📍 감지 구역: <span id="main-cam-loc">단속 구역 A-1</span></p>
+            <p>⏰ 감지 시간: <span id="main-cam-time">-</span></p>
+            <p>🚦 상태: <span id="main-cam-status">차량 대기 중</span></p>
+        </div>
+    </div>
 </div>
-
 
 <div class="section">
-<h2>🚘 번호판 기록</h2>
-
-<table>
-<tr>
-<th>ID</th>
-<th>Detection ID</th>
-<th>번호판</th>
-<th>사진</th>
-<th>시간</th>
-</tr>
-
-<tr>
-<td>1</td>
-<td>1</td>
-<td>12가3456</td>
-<td><img src="plate1.jpg"></td>
-<td>2026-03-10 14:07</td>
-</tr>
-
-</table>
+    <h2>📷 차량 감지 및 번호판 통합 기록</h2>
+    <table>
+        <thead>
+            <tr>
+                <th>ID</th>
+                <th>사진</th>
+                <th>번호판</th>
+                <th>시간</th>
+                <th>상태</th>
+            </tr>
+        </thead>
+        <tbody id="detection_table"></tbody>
+    </table>
 </div>
+
+<div class="section">
+    <h2>🔍 터틀봇 정밀 촬영 상세 (Last Action)</h2>
+    <div class="robot-detail">
+        <div class="plate-img-box">
+            <p><strong>로봇 촬영 원본</strong></p>
+            <img id="robot-detail-img" src="https://via.placeholder.com/350x200?text=No+Data">
+        </div>
+        <div class="plate-text-box">
+            <p><strong>인식된 번호판</strong></p>
+            <div id="robot-detail-plate" class="plate-number">----</div>
+            <p style="margin-top:20px;">출동 로봇: <span id="robot-detail-id" style="font-weight:bold;">-</span></p>
+        </div>
+    </div>
+</div>
+
+<script>
+    // 파이어베이스 설정값 (본인의 것으로 교체 필수)
+    const firebaseConfig = {
+        apiKey: "YOUR_API_KEY",
+        authDomain: "YOUR_PROJECT.firebaseapp.com",
+        databaseURL: "https://YOUR_PROJECT-default-rtdb.firebaseio.com",
+        projectId: "YOUR_PROJECT",
+    };
+
+    firebase.initializeApp(firebaseConfig);
+    const db = firebase.database();
+
+    // 1. 웹캠 실시간 감지 리스너 (경로: /main_camera)
+    db.ref("main_camera").on("value", (snapshot) => {
+        const data = snapshot.val();
+        if(data) {
+            document.getElementById("main-cam-img").src = data.image;
+            document.getElementById("main-cam-loc").innerText = data.location;
+            document.getElementById("main-cam-time").innerText = data.time;
+            document.getElementById("main-cam-status").innerText = data.status;
+        }
+    });
+
+    // 2. 터틀봇 정밀 촬영 리스너 (경로: /latest_capture)
+    db.ref("latest_capture").on("value", (snapshot) => {
+        const data = snapshot.val();
+        if(data) {
+            document.getElementById("robot-detail-img").src = data.image;
+            document.getElementById("robot-detail-plate").innerText = data.plate;
+            document.getElementById("robot-detail-id").innerText = data.robot_id;
+        }
+    });
+
+    // 3. 로봇 상태 및 테이블 리스너 (기존 로직 유지)
+    const robots = ["tb4_01", "tb4_02"];
+    robots.forEach((id, idx) => {
+        db.ref("robot_status/" + id).on("value", (snap) => {
+            const d = snap.val();
+            if(d) {
+                document.getElementById(`bat${idx+1}-bar`).style.width = d.battery + "%";
+                document.getElementById(`bat${idx+1}-text`).innerText = d.battery + "%";
+                document.getElementById(`pos${idx+1}`).innerText = d.location;
+            }
+        });
+    });
+
+    db.ref("detections").limitToLast(10).on("child_added", (snap) => {
+        const d = snap.val();
+        const row = `<tr>
+            <td>${snap.key}</td>
+            <td><img src="${d.image}" style="width:100px;"></td>
+            <td>${d.plate}</td>
+            <td>${d.time}</td>
+            <td><span class="status-badge">${d.status}</span></td>
+        </tr>`;
+        document.getElementById("detection_table").insertAdjacentHTML('afterbegin', row);
+    });
+</script>
 
 </body>
 </html>
