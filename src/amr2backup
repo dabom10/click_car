@@ -1,0 +1,74 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import rclpy
+
+from turtlebot4_navigation.turtlebot4_navigator import (
+    TurtleBot4Directions,
+    TurtleBot4Navigator,
+)
+
+
+# ================================
+# 설정 상수
+# ================================
+# INITIAL_POSITION = [0.142463,1.76936]
+# INITIAL_DIRECTION = -5.43
+INITIAL_POSITION = [0.0,0.0]
+INITIAL_DIRECTION = TurtleBot4Directions.NORTH
+
+WAYPOINTS = [ 
+    ([-0.725, -0.2], TurtleBot4Directions.WEST),   
+    ([-0.725, 1.9], TurtleBot4Directions.SOUTH),     
+    ([-2.1, 1.95], TurtleBot4Directions.EAST),   
+    ([-2.15, -0.3], TurtleBot4Directions.EAST),    
+    ([-2.3, -2.0], TurtleBot4Directions.EAST),  
+    ([-2.4, -4.0], TurtleBot4Directions.NORTH), 
+    ([2.1, -4.0], TurtleBot4Directions.WEST), 
+    ([1.97, -2.5], TurtleBot4Directions.SOUTH),  
+    ([-1.5, -2.2], TurtleBot4Directions.WEST),
+]
+
+
+def main():
+    rclpy.init()
+
+    navigator = TurtleBot4Navigator()
+
+    # 도킹 상태가 아니면 먼저 도킹해서 시작 상태를 맞춤
+    if not navigator.getDockedStatus():
+        navigator.info('Docking before initialising pose')
+        navigator.dock()
+
+    # 초기 위치 설정
+    initial_pose = navigator.getPoseStamped(INITIAL_POSITION, INITIAL_DIRECTION)
+    navigator.setInitialPose(initial_pose)
+
+    # Nav2 활성화 대기
+    navigator.waitUntilNav2Active()
+
+    # 웨이포인트 생성
+    goal_pose_list = []
+    for position, direction in WAYPOINTS:
+        goal_pose_list.append(navigator.getPoseStamped(position, direction))
+
+    # 도킹 해제
+    navigator.undock()
+
+    # 웨이포인트 순차 이동 시작
+    navigator.startFollowWaypoints(goal_pose_list)
+
+    # 작업 완료까지 대기
+    while not navigator.isTaskComplete():
+        feedback = navigator.getFeedback()
+        if feedback is not None:
+            navigator.info(f'Current waypoint index: {feedback.current_waypoint}')
+
+    # 완료 후 다시 도킹
+    navigator.dock()
+
+    rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()
