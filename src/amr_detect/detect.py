@@ -39,7 +39,7 @@ from firebase_admin import credentials, db
 # ──────────────────────────────────────────────
 ROBOT_NAMESPACE          = "/robot2"
 MODEL_PATH               = "/home/rokey/click_car/models/AMR/v1/weights/best.pt"
-FIREBASE_CRED_PATH       = "/home/rokey/click_car/web/database.json"
+FIREBASE_CRED_PATH       = "clickcar-38016-firebase-adminsdk-fbsvc-f9e6029a7.json"
 FIREBASE_DB_URL          = "https://click-car-2f586-default-rtdb.asia-southeast1.firebasedatabase.app"
 CONF_THRESHOLD           = 0.70   # YOLO 탐지 및 DB 저장 공통 신뢰도 기준
 ID_IN_CAR_OVERLAP_THRESH = 0.50   # 번호판이 차량 내부에 있다고 판단할 최소 중첩 비율
