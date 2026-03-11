@@ -38,14 +38,14 @@ from firebase_admin import credentials, db
 # [CHAPTER 1: 하이퍼파라미터]
 # ──────────────────────────────────────────────
 ROBOT_NAMESPACE          = "/robot2"
-MODEL_PATH               = "/home/rokey/click_car/models/AMR/v1/weights/best.pt"
+MODEL_PATH               = "/home/rokey/click_car/models/amr.pt"
 FIREBASE_CRED_PATH       = "clickcar-38016-firebase-adminsdk-fbsvc-f9e6029a7.json"
 FIREBASE_DB_URL          = "https://click-car-2f586-default-rtdb.asia-southeast1.firebasedatabase.app"
 CONF_THRESHOLD           = 0.70   # YOLO 탐지 및 DB 저장 공통 신뢰도 기준
 ID_IN_CAR_OVERLAP_THRESH = 0.50   # 번호판이 차량 내부에 있다고 판단할 최소 중첩 비율
 YOLO_IMG_SIZE            = 320    # 추론 해상도 (정밀도 ↔ 속도 트레이드오프)
 SAVE_QUEUE_MAXSIZE       = 30     # 30fps × 최대 지연 1s 기준 메모리 상한
-CAM_FPS_LOG_INTERVAL     = 5.0   # 카메라 FPS 로그 출력 주기 (초)
+CAM_FPS_LOG_INTERVAL     = 5.0    # 카메라 FPS 로그 출력 주기 (초)
 
 
 # ──────────────────────────────────────────────
@@ -96,6 +96,9 @@ class PlateDetectionNode(Node):
             source=np.zeros((YOLO_IMG_SIZE, YOLO_IMG_SIZE, 3), dtype=np.uint8),
             imgsz=YOLO_IMG_SIZE, verbose=False
         )
+        # [DEBUG-1] 모델이 인식하는 클래스명 전체 출력
+        # → "car"/"id"가 아닌 다른 이름이 찍히면 아래 필터 조건 수정 필요
+        self.get_logger().info(f"[DEBUG-1] Model classes: {self.model.names}")
         self.get_logger().info("YOLO warm-up complete.")
 
     def _init_firebase(self):
@@ -108,7 +111,8 @@ class PlateDetectionNode(Node):
             self.db_ref = db.reference("detections")
             self.get_logger().info("Firebase connected.")
         except Exception as e:
-            self.get_logger().error(f"Firebase init failed: {e}")
+            # [DEBUG-2] 인증 실패 상세 원인 출력 → 경로/URL/권한 문제 확인
+            self.get_logger().error(f"[DEBUG-2] Firebase init failed: {e}")
 
     def _init_subscriber(self):
         ''' Best Effort QoS로 최신 프레임 우선 수신 '''
@@ -131,6 +135,8 @@ class PlateDetectionNode(Node):
         # 1. 디코딩
         frame = cv2.imdecode(np.array(msg.data, dtype=np.uint8), cv2.IMREAD_COLOR)
         if frame is None:
+            # [DEBUG-3] 디코딩 실패 → 토픽 데이터 포맷 문제
+            self.get_logger().warn("[DEBUG-3] Frame decode failed. Check topic format.")
             return
 
         # 2. 카메라 FPS 측정
@@ -148,10 +154,39 @@ class PlateDetectionNode(Node):
         cars, ids = self._detect(frame)
         self.last_detections = cars + ids
 
+        # [DEBUG-4] 매 프레임 탐지 결과 요약
+        # cars=0, ids=0 → YOLO 미탐 (신뢰도/클래스명 문제)
+        # cars>0, ids=0 → 차량만 탐지, 번호판 미탐
+        # cars=0, ids>0 → 번호판만 탐지 → Overlap 검증 항상 실패
+        self.get_logger().info(
+            f"[DEBUG-4] Detect result — cars: {len(cars)}, plates: {len(ids)}"
+        )
+
         # 4. 검증 후 큐 투입
         for id_det in ids:
             car = self._find_parent_car(id_det, cars)
+
+            # [DEBUG-5] 번호판별 Overlap 검증 결과
+            self.get_logger().info(
+                f"[DEBUG-5] Plate conf={id_det['conf']:.2f} "
+                f"bbox=({id_det['x1']},{id_det['y1']},{id_det['x2']},{id_det['y2']}) "
+                f"→ parent_car={'FOUND' if car else 'NONE'}"
+            )
+
             if car is None:
+                # [DEBUG-6] car가 있는데도 NONE → 실제 overlap 수치 출력
+                # overlap 값이 threshold보다 낮으면 ID_IN_CAR_OVERLAP_THRESH 하향 조정 필요
+                if cars:
+                    id_area = max(1, id_det["area"])
+                    for i, c in enumerate(cars):
+                        ix = max(0, min(id_det["x2"], c["x2"]) - max(id_det["x1"], c["x1"]))
+                        iy = max(0, min(id_det["y2"], c["y2"]) - max(id_det["y1"], c["y1"]))
+                        ov = (ix * iy) / id_area
+                        self.get_logger().info(
+                            f"[DEBUG-6]   car[{i}] "
+                            f"bbox=({c['x1']},{c['y1']},{c['x2']},{c['y2']}) "
+                            f"overlap={ov:.3f} / threshold={ID_IN_CAR_OVERLAP_THRESH}"
+                        )
                 continue
 
             self.get_logger().info(
@@ -159,6 +194,10 @@ class PlateDetectionNode(Node):
             )
             try:
                 self.save_queue.put_nowait({"frame": frame, "car": car, "id": id_det})
+                # [DEBUG-7] 큐 투입 성공 확인
+                self.get_logger().info(
+                    f"[DEBUG-7] Queued OK. size={self.save_queue.qsize()}/{SAVE_QUEUE_MAXSIZE}"
+                )
             except queue.Full:
                 self.get_logger().warn(
                     f"Queue full ({SAVE_QUEUE_MAXSIZE}). Frame dropped."
@@ -276,12 +315,22 @@ class PlateDetectionNode(Node):
         번호판 영역 크롭 → JPG 재압축 → Base64 인코딩 → Firebase 전송.
         경로: detections/{timestamp}
         '''
+        # [DEBUG-8] Firebase 연결 상태 확인
         if self.db_ref is None:
+            self.get_logger().error(
+                "[DEBUG-8] db_ref is None — Firebase 미연결. "
+                "시작 로그의 [DEBUG-2] 확인 필요."
+            )
             return
 
         x1, y1, x2, y2 = id_det["x1"], id_det["y1"], id_det["x2"], id_det["y2"]
         crop = frame[y1:y2, x1:x2]
         if crop.size == 0:
+            # [DEBUG-9] bbox 좌표 오류로 crop 영역이 비어있는 경우
+            self.get_logger().warn(
+                f"[DEBUG-9] Empty crop. "
+                f"id_bbox=({x1},{y1},{x2},{y2}), frame_shape={frame.shape}"
+            )
             return
 
         now = datetime.datetime.now()
