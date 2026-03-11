@@ -119,7 +119,7 @@ if __name__ == "__main__":
     print("=" * 50)
     print("실험 A+C 시작")
     print("=" * 50)
-    train_AC()
+    train_v5()
 
     # print("=" * 50)
     # print("실험 A+B+C 시작")
