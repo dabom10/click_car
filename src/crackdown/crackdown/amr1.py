@@ -32,19 +32,24 @@ def get_current_yaw():
     return yaw[0]
 
 # ── 웨이포인트 정의 ──────────────────────────────────────
-# (x, y, 방향) - 방향은 NORTH/SOUTH/EAST/WEST 또는 각도
 WAYPOINTS = [
     ([-0.725, -0.2],  TurtleBot4Directions.WEST),
-    ([-0.725, 1.9],  TurtleBot4Directions.SOUTH),
-    ([-2.1, 1.95],  TurtleBot4Directions.EAST),
-    ([-2.15, -0.3],  TurtleBot4Directions.EAST),
-    ([-2.3, -2.0],  TurtleBot4Directions.EAST),
-    ([-2.4, -4.0],  TurtleBot4Directions.NORTH),
-    ([2.1, -4.0],  TurtleBot4Directions.WEST),
-    ([1.97, -2.5],  TurtleBot4Directions.SOUTH),
-    ([-1.5, -2.2],  TurtleBot4Directions.WEST),
-    ([-0.63, -0.20],  TurtleBot4Directions.NORTH),
+    ([-0.725,  1.9],  TurtleBot4Directions.SOUTH),
+    ([-2.1,   1.95],  TurtleBot4Directions.EAST),
+    ([-2.15, -0.3],   TurtleBot4Directions.EAST),
+    ([-2.3,  -2.0],   TurtleBot4Directions.EAST),
+    ([-2.4,  -4.0],   TurtleBot4Directions.NORTH),
+    ([ 2.1,  -4.0],   TurtleBot4Directions.WEST),
+    ([ 1.97, -2.5],   TurtleBot4Directions.SOUTH),
+    ([-1.5,  -2.2],   TurtleBot4Directions.WEST),
+    # ([-0.63, -0.20],  TurtleBot4Directions.NORTH),    # dock
 ]
+
+# INITIAL_POSITION = [0.0,0.0]    # 1 기준
+INITIAL_POSITION = [0.1424, 1.769]    # 2 기준
+
+# DOCKING_POSITION1 = [-0.63, -0.20]
+DOCKING_POSITION2 = [-2.5, -1.7]
 
 def main():
     rclpy.init()
@@ -58,8 +63,7 @@ def main():
 
     actual_yaw = get_current_yaw()
     navigator.info(f'측정된 yaw: {actual_yaw:.3f} rad')
-    initial_pose = navigator.getPoseStamped([0.0, 0.0], actual_yaw)
-    # initial_pose = navigator.getPoseStamped([0.0, 0.0], TurtleBot4Directions.NORTH)    
+    initial_pose = navigator.getPoseStamped(INITIAL_POSITION, actual_yaw)
     navigator.setInitialPose(initial_pose)
 
     # ── Nav2 준비 대기 ────────────────────────────────
@@ -75,16 +79,21 @@ def main():
 
     navigator.info(f'웨이포인트 {len(goal_pose)}개 등록 완료. 순찰 시작!')
 
-    # ── 웨이포인트 순서대로 이동 ──────────────────────
-    navigator.startFollowWaypoints(goal_pose)
+    # ── 무한 순환 루프 ────────────────────────────────
+    try:
+        while True:
+            navigator.startFollowWaypoints(goal_pose)
+    except KeyboardInterrupt:
+        navigator.cancelTask()  # Nav2 목표 취소
+        navigator.startFollowWaypoints(DOCKING_POSITION2, TurtleBot4Directions.NORTH)
+        navigator.dock()
 
-    navigator.info('모든 웨이포인트 완료 → 도킹 복귀')
+    # ── 이후 탈출 조건 생기면 여기 실행됨 ────────────
+    # navigator.info('단속 대상 탐지 → 순찰 중단')
 
-    # ── 도킹 복귀 ────────────────────────────────────
-    navigator.dock()
+    # navigator.dock()
 
     rclpy.shutdown()
-
 
 if __name__ == '__main__':
     main()
