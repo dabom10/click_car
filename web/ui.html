@@ -114,37 +114,45 @@
 <script>
     // 파이어베이스 설정값 (본인의 것으로 교체 필수)
     const firebaseConfig = {
-        apiKey: "YOUR_API_KEY",
-        authDomain: "YOUR_PROJECT.firebaseapp.com",
-        databaseURL: "https://YOUR_PROJECT-default-rtdb.firebaseio.com",
-        projectId: "YOUR_PROJECT",
+        apiKey: "AIzaSyAaurCi5v2w2pab8592QeNtG7Rx_iViVss",
+        authDomain: "clickcar-38016.firebaseapp.com",
+        databaseURL: "https://clickcar-38016-default-rtdb.asia-southeast1.firebasedatabase.app",
+        projectId: "clickcar-38016",
     };
 
-    firebase.initializeApp(firebaseConfig);
+ firebase.initializeApp(firebaseConfig);
     const db = firebase.database();
 
-    // 1. 웹캠 실시간 감지 리스너 (경로: /main_camera)
-    db.ref("main_camera").on("value", (snapshot) => {
+    // --- 1. 터틀봇 정밀 촬영 및 로그 업데이트 리스너 ---
+    // 스크린샷의 데이터가 쌓이는 경로가 "detections"라고 가정합니다.
+    db.ref("detections").limitToLast(10).on("child_added", (snapshot) => {
         const data = snapshot.val();
-        if(data) {
-            document.getElementById("main-cam-img").src = data.image;
-            document.getElementById("main-cam-loc").innerText = data.location;
-            document.getElementById("main-cam-time").innerText = data.time;
-            document.getElementById("main-cam-status").innerText = data.status;
-        }
+        
+        // Base64 이미지 포맷팅
+        const base64Image = `data:image/jpeg;base64,${data.image_base64}`;
+        
+        // 시간 포맷팅 (ISO 형식을 읽기 편하게 변경)
+        const date = new Date(data.detected_at);
+        const timeStr = date.toLocaleString();
+
+        // [하단 섹션] 가장 최신 데이터 업데이트 (정밀 촬영 상세)
+        document.getElementById("robot-detail-img").src = base64Image;
+        document.getElementById("robot-detail-plate").innerText = data.id_confidence ? (data.id_confidence * 100).toFixed(1) + "%" : "N/A";
+        document.getElementById("robot-detail-id").innerText = "Turtlebot 4"; // 고정값 혹은 데이터에서 가져오기
+
+        // [중간 섹션] 테이블에 행 추가
+        const row = `
+            <tr>
+                <td>${snapshot.key.substring(15)}</td> <td><img src="${base64Image}" style="width:100px;"></td>
+                <td><strong>${data.id_confidence ? "확률: " + (data.id_confidence * 100).toFixed(1) + "%" : "분석중"}</strong></td>
+                <td>${timeStr}</td>
+                <td><span class="status-badge">감지완료</span></td>
+            </tr>
+        `;
+        document.getElementById("detection_table").insertAdjacentHTML('afterbegin', row);
     });
 
-    // 2. 터틀봇 정밀 촬영 리스너 (경로: /latest_capture)
-    db.ref("latest_capture").on("value", (snapshot) => {
-        const data = snapshot.val();
-        if(data) {
-            document.getElementById("robot-detail-img").src = data.image;
-            document.getElementById("robot-detail-plate").innerText = data.plate;
-            document.getElementById("robot-detail-id").innerText = data.robot_id;
-        }
-    });
-
-    // 3. 로봇 상태 및 테이블 리스너 (기존 로직 유지)
+    // --- 2. 로봇 배터리/위치 정보 (기존 유지) ---
     const robots = ["tb4_01", "tb4_02"];
     robots.forEach((id, idx) => {
         db.ref("robot_status/" + id).on("value", (snap) => {
@@ -155,18 +163,6 @@
                 document.getElementById(`pos${idx+1}`).innerText = d.location;
             }
         });
-    });
-
-    db.ref("detections").limitToLast(10).on("child_added", (snap) => {
-        const d = snap.val();
-        const row = `<tr>
-            <td>${snap.key}</td>
-            <td><img src="${d.image}" style="width:100px;"></td>
-            <td>${d.plate}</td>
-            <td>${d.time}</td>
-            <td><span class="status-badge">${d.status}</span></td>
-        </tr>`;
-        document.getElementById("detection_table").insertAdjacentHTML('afterbegin', row);
     });
 </script>
 
