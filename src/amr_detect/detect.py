@@ -23,7 +23,6 @@ import base64
 import datetime
 import queue
 import threading
-import time
 import cv2
 import numpy as np
 import rclpy
@@ -46,25 +45,13 @@ from firebase_admin import credentials, db
   예를 들어 로봇 네임스페이스가 /robot1으로 바뀌거나 모델 경로가 변경될 때,
   해당 상수 한 줄만 수정하면 노드 전체에 즉시 반영된다.
 
-[설계 결정 2] CONF_THRESHOLD 단일화
-  초기 설계에는 YOLO 탐지용(0.50)과 DB 저장용(0.70) 두 개의 임계값이 있었다.
-  이를 0.50 하나로 통일한 이유는 필터링 단계를 줄여 파이프라인을 단순하게
-  유지하면서, Overlap 검증이 2차 필터 역할을 대신하기 때문이다.
-  두 임계값을 나누면 "탐지는 됐지만 저장 안 된" 케이스가 발생해
-  디버깅 시 혼란을 줄 수 있다.
-
-[설계 결정 3] SAVE_QUEUE_MAXSIZE = 30
-  RGB 카메라가 30fps이고 Firebase 평균 지연이 최대 1초라고 가정할 때,
-  그 사이에 쌓일 수 있는 최대 프레임은 30장이다.
+[설계 결정 3] SAVE_QUEUE_MAXSIZE = 10
+  RGB 카메라가 10fps이고 Firebase 평균 지연이 최대 1초라고 가정할 때,
+  그 사이에 쌓일 수 있는 최대 프레임은 10장이다.
   큐 상한 없이 방치하면 네트워크 장애 시 메모리가 무한 증가하므로
   maxsize로 상한을 설정하고, 초과 시 최신 프레임을 드롭하는 방식을 선택했다.
   오래된 데이터보다 최신 데이터를 잃는 쪽이 운영상 허용 가능하다고 판단했기
   때문이다. (번호판 탐지 특성상 같은 차량이 여러 프레임에 걸쳐 탐지됨)
-
-[설계 결정 4] CAM_FPS_LOG_INTERVAL = 5.0
-  매 프레임마다 FPS를 계산해 로그를 찍으면 로그가 초당 30회 출력되어
-  다른 중요한 로그를 묻히게 된다. 5초 간격 집계로 로그 노이즈를 줄이면서
-  실시간성도 충분히 유지한다.
 ════════════════════════════════════════════════════════════════
 '''
 
@@ -75,11 +62,10 @@ ROBOT_NAMESPACE          = "/robot2"
 MODEL_PATH               = "/home/rokey/click_car/models/amr.pt"
 FIREBASE_CRED_PATH       = "/home/rokey/click_car/web/click_car.json"
 FIREBASE_DB_URL          = "https://iligalstop-default-rtdb.asia-southeast1.firebasedatabase.app"
-CONF_THRESHOLD           = 0.50   # YOLO 탐지 및 DB 저장 공통 신뢰도 기준
-ID_IN_CAR_OVERLAP_THRESH = 0.50   # 번호판이 차량 내부에 있다고 판단할 최소 중첩 비율
-YOLO_IMG_SIZE            = 320    # 추론 해상도 (정밀도 ↔ 속도 트레이드오프)
-SAVE_QUEUE_MAXSIZE       = 30     # 30fps × 최대 지연 1s 기준 메모리 상한
-CAM_FPS_LOG_INTERVAL     = 5.0    # 카메라 FPS 로그 출력 주기 (초)
+CONF_THRESHOLD           = 0.70
+ID_IN_CAR_OVERLAP_THRESH = 0.50
+YOLO_IMG_SIZE            = 704
+SAVE_QUEUE_MAXSIZE       = 10
 
 
 '''
@@ -137,19 +123,9 @@ class PlateDetectionNode(Node):
     def __init__(self):
         super().__init__("plate_detection_node")
 
-        # 상태 변수
-        self.last_detections   = []
-        self.last_inference_ms = 0.0
-        self.save_queue        = queue.Queue(maxsize=SAVE_QUEUE_MAXSIZE)
-        self.db_ref            = None
-
-        # 카메라 FPS 측정용 변수
-        # - _cam_frame_count : 마지막 집계 이후 수신된 프레임 수
-        # - _cam_fps_timer   : 마지막 집계 시각 (perf_counter 기준)
-        # - _cam_fps         : 가장 최근에 계산된 카메라 FPS (오버레이 표시용)
-        self._cam_frame_count = 0
-        self._cam_fps_timer   = time.perf_counter()
-        self._cam_fps         = 0.0
+        self.last_detections = []
+        self.save_queue      = queue.Queue(maxsize=SAVE_QUEUE_MAXSIZE)
+        self.db_ref          = None
 
         self._load_model()
         self._init_firebase()
@@ -169,8 +145,6 @@ class PlateDetectionNode(Node):
             source=np.zeros((YOLO_IMG_SIZE, YOLO_IMG_SIZE, 3), dtype=np.uint8),
             imgsz=YOLO_IMG_SIZE, verbose=False
         )
-        # [DEBUG-1] 모델이 인식하는 클래스명 전체 출력
-        # → "car"/"id"가 아닌 다른 이름이 찍히면 아래 필터 조건 수정 필요
         self.get_logger().info(f"[DEBUG-1] Model classes: {self.model.names}")
         self.get_logger().info("YOLO warm-up complete.")
 
@@ -184,7 +158,6 @@ class PlateDetectionNode(Node):
             self.db_ref = db.reference("detections")
             self.get_logger().info("Firebase connected.")
         except Exception as e:
-            # [DEBUG-2] 인증 실패 상세 원인 출력 → 경로/URL/권한 문제 확인
             self.get_logger().error(f"[DEBUG-2] Firebase init failed: {e}")
 
     def _init_subscriber(self):
@@ -210,25 +183,13 @@ class PlateDetectionNode(Node):
       np.array(msg.data, dtype=np.uint8)은 한 번의 복사로 동일한 결과를 얻는다.
       30fps 환경에서 매 프레임 불필요한 복사를 줄이면 GC 압박도 감소한다.
 
-    [설계 결정 2] 카메라 FPS를 callback 호출 횟수로 측정하는 이유
-      msg.header.stamp 차이로도 FPS를 계산할 수 있지만,
-      ROS2 시간 동기화 문제나 카메라 드라이버의 타임스탬프 부정확성에 영향받는다.
-      callback 호출 주기는 실제로 이 노드가 프레임을 수신하는 속도이므로
-      "이 노드 관점의 실효 FPS"를 가장 정확하게 반영한다.
-
-    [설계 결정 3] YOLO 추론 시간 측정에 time.perf_counter() 사용
-      datetime.datetime.now() 차이 연산은 OS 시스템 클럭을 사용하므로
-      수십 ms 단위 측정에서 오차가 발생할 수 있다.
-      time.perf_counter()는 단조증가(monotonic) 고해상도 타이머로,
-      짧은 구간 측정에서 더 정확하다.
-
-    [설계 결정 4] Overlap 기반 검증 로직을 별도 함수로 분리한 이유
+    [설계 결정 2] Overlap 기반 검증 로직을 별도 함수로 분리한 이유
       image_callback 내부에 인라인으로 넣으면 콜백 함수가 지나치게 길어지고,
       임계값 조정이나 알고리즘 교체 시 콜백 전체를 수정해야 한다.
       _find_parent_car()로 분리하면 단위 테스트도 가능하고,
       향후 IoU 계산 방식을 변경해도 콜백 로직에 영향이 없다.
 
-    [설계 결정 5] save_queue.put_nowait() 선택 이유
+    [설계 결정 3] save_queue.put_nowait() 선택 이유
       blocking put()을 사용하면 큐가 가득 찼을 때 메인 스레드가 대기 상태에
       빠져 ROS2 spin이 지연된다. put_nowait()는 즉시 Full 예외를 발생시키므로
       콜백이 블로킹 없이 반환된다. 프레임 드롭은 허용하되 실시간성을 유지하는
@@ -241,43 +202,28 @@ class PlateDetectionNode(Node):
     def image_callback(self, msg: CompressedImage):
         '''
         [CHAPTER 3: 실시간 데이터 파이프라인]
-        Bytes → NumPy 디코딩 → 카메라 FPS 집계 → YOLO 추론 → Overlap 검증 → 큐 투입
+        Bytes → NumPy 디코딩 → YOLO 추론 → Overlap 검증 → 큐 투입
         '''
-        # 1. 디코딩
         frame = cv2.imdecode(np.array(msg.data, dtype=np.uint8), cv2.IMREAD_COLOR)
         if frame is None:
-            # [DEBUG-3] 디코딩 실패 → 토픽 데이터 포맷 문제
             self.get_logger().warn("[DEBUG-3] Frame decode failed. Check topic format.")
             return
 
-        # 2. 카메라 FPS 측정
-        # callback 호출 주기 = 카메라가 실제로 프레임을 전달하는 주기이므로
-        # 이 카운터가 가장 정확한 수신 FPS를 반영합니다.
-        self._cam_frame_count += 1
-        elapsed = time.perf_counter() - self._cam_fps_timer
-        if elapsed >= CAM_FPS_LOG_INTERVAL:
-            self._cam_fps = self._cam_frame_count / elapsed
-            self.get_logger().info(f"Camera FPS: {self._cam_fps:.1f}")
-            self._cam_frame_count = 0
-            self._cam_fps_timer   = time.perf_counter()
-
-        # 3. 추론
         cars, ids = self._detect(frame)
         self.last_detections = cars + ids
 
-        # [DEBUG-4] 매 프레임 탐지 결과 요약
-        # cars=0, ids=0 → YOLO 미탐 (신뢰도/클래스명 문제)
-        # cars>0, ids=0 → 차량만 탐지, 번호판 미탐
-        # cars=0, ids>0 → 번호판만 탐지 → Overlap 검증 항상 실패
         self.get_logger().info(
             f"[DEBUG-4] Detect result — cars: {len(cars)}, plates: {len(ids)}"
         )
 
-        # 4. 검증 후 큐 투입
         for id_det in ids:
             car = self._find_parent_car(id_det, cars)
 
-            # [DEBUG-5] 번호판별 Overlap 검증 결과
+            '''
+            [DEBUG-5] _find_parent_car() 판정 결과 1차 확인
+            번호판 하나당 한 줄씩 출력되며, FOUND/NONE으로 즉시 판정 여부 확인 가능
+            NONE이 계속 찍힌다면 → [DEBUG-6]으로 원인 분석
+            '''
             self.get_logger().info(
                 f"[DEBUG-5] Plate conf={id_det['conf']:.2f} "
                 f"bbox=({id_det['x1']},{id_det['y1']},{id_det['x2']},{id_det['y2']}) "
@@ -285,13 +231,29 @@ class PlateDetectionNode(Node):
             )
 
             if car is None:
-                # [DEBUG-6] car가 있는데도 NONE → 실제 overlap 수치 출력
-                # overlap 값이 threshold보다 낮으면 ID_IN_CAR_OVERLAP_THRESH 하향 조정 필요
+                '''
+                [DEBUG-6] 차량은 탐지됐는데 NONE이 나온 경우 → 실제 overlap 수치 분석
+                조건: cars가 비어있지 않음 = "탐지는 됐지만 threshold를 못 넘긴" 상황
+                목적: overlap 값을 보고 ID_IN_CAR_OVERLAP_THRESH 조정 여부를 판단
+                  예시) overlap=0.38 → threshold 0.50을 못 넘김 → 0.35로 낮추면 통과
+                  예시) overlap=0.12 → 실제로 다른 차량의 번호판일 가능성 높음
+                '''
                 if cars:
                     id_area = max(1, id_det["area"])
                     for i, c in enumerate(cars):
+                        '''
+                        번호판(id)과 차량(car) bbox의 교집합 너비·높이 계산
+                        max(0, ...) : 겹치지 않는 경우 음수가 되는 것을 0으로 클램핑
+                        '''
                         ix = max(0, min(id_det["x2"], c["x2"]) - max(id_det["x1"], c["x1"]))
                         iy = max(0, min(id_det["y2"], c["y2"]) - max(id_det["y1"], c["y1"]))
+
+                        '''
+                        단방향 overlap = 교집합 면적 / 번호판 면적
+                        IoU(합집합 기준) 대신 번호판 기준으로 계산하는 이유:
+                        번호판은 차량보다 훨씬 작아서 IoU를 쓰면 완전히 안에 들어가도 값이 낮게 나옴
+                        overlap 값과 threshold를 나란히 출력 → 한눈에 조정 필요 여부 판단 가능
+                        '''
                         ov = (ix * iy) / id_area
                         self.get_logger().info(
                             f"[DEBUG-6]   car[{i}] "
@@ -305,7 +267,6 @@ class PlateDetectionNode(Node):
             )
             try:
                 self.save_queue.put_nowait({"frame": frame, "car": car, "id": id_det})
-                # [DEBUG-7] 큐 투입 성공 확인
                 self.get_logger().info(
                     f"[DEBUG-7] Queued OK. size={self.save_queue.qsize()}/{SAVE_QUEUE_MAXSIZE}"
                 )
@@ -322,23 +283,17 @@ class PlateDetectionNode(Node):
     [_detect 코드 리뷰: YOLO 추론 엔진]
     ════════════════════════════════════════════════════════════════
 
-    [설계 결정 1] imgsz=320 선택 이유
-      YOLOv8은 입력 해상도가 클수록 정밀도는 높아지지만 추론 시간이 증가한다.
-      640의 경우 CPU에서 약 200ms(5fps), 320은 약 50ms(20fps) 수준이다.
-      번호판은 비교적 작은 객체이므로 320에서도 충분한 탐지율을 보이며,
-      실시간 30fps 처리를 위해 속도를 우선했다.
-
-    [설계 결정 2] verbose=False 설정
+    [설계 결정 1] verbose=False 설정
       YOLO의 기본 verbose=True는 매 추론마다 터미널에 결과를 출력한다.
-      30fps 환경에서 초당 30줄이 출력되면 ROS2 로그가 묻히고
+      10fps 환경에서 초당 10줄이 출력되면 ROS2 로그가 묻히고
       터미널 I/O 자체가 성능 병목이 될 수 있어 비활성화했다.
 
-    [설계 결정 3] results[0].boxes 순회 방식
+    [설계 결정 2] results[0].boxes 순회 방식
       results가 리스트로 반환되는 이유는 배치 추론(여러 이미지 동시 처리)을
       지원하기 위해서다. 이 노드는 단일 프레임 처리이므로 results[0]만 사용한다.
       results가 빈 리스트일 경우의 예외 처리를 앞에 두어 불필요한 순회를 막는다.
 
-    [설계 결정 4] box.xyxy[0].cpu().numpy() 변환 이유
+    [설계 결정 3] box.xyxy[0].cpu().numpy() 변환 이유
       YOLO 출력은 기본적으로 GPU 텐서(torch.Tensor)다.
       OpenCV와 NumPy는 CPU 메모리를 사용하므로 .cpu()로 디바이스를 이동 후
       .numpy()로 변환해야 한다. GPU가 없는 환경에서도 .cpu()는 무해하다.
@@ -347,17 +302,11 @@ class PlateDetectionNode(Node):
 
     def _detect(self, frame: np.ndarray) -> tuple[list, list]:
         '''
-        YOLOv8 추론. 추론 시간을 측정하여 로그 및 오버레이에 반영.
+        YOLOv8 추론.
         반환: (cars, ids) — 각각 탐지 dict 리스트
         '''
-        t0 = time.perf_counter()
         results = self.model.predict(source=frame, imgsz=YOLO_IMG_SIZE,
                                      conf=CONF_THRESHOLD, verbose=False)
-        self.last_inference_ms = (time.perf_counter() - t0) * 1000
-        self.get_logger().info(
-            f"Inference: {self.last_inference_ms:.1f} ms "
-            f"({1000 / self.last_inference_ms:.1f} FPS)"
-        )
 
         cars, ids = [], []
         if not results:
@@ -399,6 +348,14 @@ class PlateDetectionNode(Node):
     [설계 결정 3] id_area = max(1, id_det["area"]) 처리
       bbox 좌표 오류나 단일 픽셀 탐지로 area가 0이 될 경우 ZeroDivisionError가
       발생한다. max(1, area)로 최솟값을 보장해 예외 없이 안전하게 처리한다.
+
+    [설계 결정 4] ID_IN_CAR_OVERLAP_THRESH = 0.50 설정 이유
+      번호판이 차량 bbox 면적의 50% 이상 겹쳐야 "차량 내부에 있다"고 판정한다.
+      너무 높게 (예: 0.8) 설정하면 번호판이 차량 경계선 근처에 있을 때
+      NONE 판정이 잦아지고, 너무 낮게 (예: 0.2) 설정하면 인접 차량의 번호판이
+      내 차량 안에 있다고 잘못 판정될 수 있다.
+      0.50은 "번호판의 절반 이상이 차량 안에 들어와 있어야 한다"는
+      직관적이고 균형 잡힌 기준이다.
     ════════════════════════════════════════════════════════════════
     '''
 
@@ -423,20 +380,14 @@ class PlateDetectionNode(Node):
     [_draw 코드 리뷰: 모니터링 시각화]
     ════════════════════════════════════════════════════════════════
 
-    [설계 결정 1] 시각화 정보를 3구역으로 나눈 이유
-      좌상단(추론 성능) / 중앙상단(카메라 FPS) / 우상단(큐 상태)으로 분리해
-      운영자가 한눈에 시스템 상태를 파악할 수 있도록 했다.
-      세 지표는 각각 AI 처리 속도 / 카메라 입력 속도 / 백엔드 업로드 속도를
-      나타내므로, 어느 구간에서 병목이 발생했는지 즉시 진단 가능하다.
-
-    [설계 결정 2] 큐 색상 3단계 (초록→주황→빨강) 이유
+    [설계 결정 1] 큐 색상 3단계 (초록→주황→빨강) 이유
       큐가 50% 미만이면 정상(초록), 50~99%면 경고(주황), 가득 차면 위험(빨강)으로
       구분했다. 50% 시점부터 경고를 주는 것은 Firebase 지연이 갑자기 증가할 때
       운영자가 사전에 인지할 수 있도록 하기 위함이다.
 
-    [설계 결정 3] cv2.getTextSize()로 우상단 텍스트 위치를 동적 계산하는 이유
+    [설계 결정 2] cv2.getTextSize()로 우상단 텍스트 위치를 동적 계산하는 이유
       큐 사이즈 텍스트는 "Queue: 1/30"처럼 숫자에 따라 길이가 달라진다.
-      고정 좌표를 사용하면 텍스트가 화면 밖으로 나가거나 중앙 텍스트와 겹칠 수 있다.
+      고정 좌표를 사용하면 텍스트가 화면 밖으로 나가거나 다른 텍스트와 겹칠 수 있다.
       getTextSize()로 픽셀 폭을 측정해 frame.shape[1]에서 역산하면
       항상 우측 정렬이 유지된다.
     ════════════════════════════════════════════════════════════════
@@ -447,8 +398,6 @@ class PlateDetectionNode(Node):
     def _draw(self, frame: np.ndarray):
         '''
         Bounding Box 오버레이 + 상단 HUD
-          좌상단: YOLO 추론 시간 / 추론 FPS
-          중앙상단: 카메라 수신 FPS
           우상단: Firebase 업로드 큐 상태 (초록 → 주황 → 빨강)
         '''
         for det in self.last_detections:
@@ -458,19 +407,6 @@ class PlateDetectionNode(Node):
                         (det["x1"], max(25, det["y1"] - 10)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
-        # 좌상단: YOLO 추론 성능
-        infer_fps = 1000 / self.last_inference_ms if self.last_inference_ms > 0 else 0
-        cv2.putText(frame, f"Infer: {self.last_inference_ms:.1f}ms ({infer_fps:.1f}FPS)",
-                    (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
-
-        # 중앙상단: 카메라 수신 FPS
-        cam_text = f"Cam: {self._cam_fps:.1f}FPS"
-        (cw, _), _ = cv2.getTextSize(cam_text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
-        cv2.putText(frame, cam_text,
-                    ((frame.shape[1] - cw) // 2, 25),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-
-        # 우상단: 큐 상태
         q_size  = self.save_queue.qsize()
         q_ratio = q_size / SAVE_QUEUE_MAXSIZE
         q_color = (0, 255, 0) if q_ratio < 0.5 else (0, 165, 255) if q_ratio < 1.0 else (0, 0, 255)
@@ -537,7 +473,6 @@ class PlateDetectionNode(Node):
         번호판 영역 크롭 → JPG 재압축 → Base64 인코딩 → Firebase 전송.
         경로: detections/{timestamp}
         '''
-        # [DEBUG-8] Firebase 연결 상태 확인
         if self.db_ref is None:
             self.get_logger().error(
                 "[DEBUG-8] db_ref is None — Firebase 미연결. "
@@ -548,7 +483,6 @@ class PlateDetectionNode(Node):
         x1, y1, x2, y2 = id_det["x1"], id_det["y1"], id_det["x2"], id_det["y2"]
         crop = frame[y1:y2, x1:x2]
         if crop.size == 0:
-            # [DEBUG-9] bbox 좌표 오류로 crop 영역이 비어있는 경우
             self.get_logger().warn(
                 f"[DEBUG-9] Empty crop. "
                 f"id_bbox=({x1},{y1},{x2},{y2}), frame_shape={frame.shape}"
