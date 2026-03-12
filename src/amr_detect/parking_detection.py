@@ -15,6 +15,8 @@
 
 [Interface 정의]
 - Topic (Sub): /{NS}/oakd/rgb/image_raw/compressed [sensor_msgs/CompressedImage]
+- Topic (Sub): /{NS}/oakd/stereo/image_raw/compressedDepth [sensor_msgs/CompressedImage]  ← 추가
+- Topic (Sub): /{NS}/oakd/stereo/camera_info [sensor_msgs/CameraInfo]                     ← 추가
 - Database (Out): Firebase Realtime Database
   * 경로: detections/{timestamp}
   * 타입 car  : { type, detected_at, car_conf, id_conf, car_bbox, id_bbox, image_base64 }
@@ -39,7 +41,7 @@ import numpy as np
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
-from sensor_msgs.msg import CompressedImage
+from sensor_msgs.msg import CompressedImage, CameraInfo  # ← CameraInfo 추가
 from ultralytics import YOLO
 import firebase_admin
 from firebase_admin import credentials, db
@@ -123,6 +125,11 @@ class ParkingDetectionNode(Node):
         self.save_queue       = queue.Queue(maxsize=SAVE_QUEUE_MAXSIZE)
         self.db_ref           = None
 
+        # ── [추가] Depth / CameraInfo 수신 버퍼 ──────
+        self.latest_depth_frame = None  # depth_callback에서 매 프레임 갱신 (uint16, mm)
+        self.camera_info        = None  # info_callback에서 1회 저장
+        self._depth_lock        = threading.Lock()  # depth 버퍼 스레드 안전 접근용
+
         self._load_model()
         self._init_firebase()
         self._init_subscriber()
@@ -157,14 +164,97 @@ class ParkingDetectionNode(Node):
             self.get_logger().error(f"[DEBUG-2] Firebase init failed: {e}")
 
     def _init_subscriber(self):
-        ''' Best Effort QoS로 최신 프레임 우선 수신 '''
-        qos = QoSProfile(
+        '''
+        카메라 토픽 3종 구독.
+        - RGB   (BEST_EFFORT): image_callback → YOLO 추론 메인 파이프라인
+        - Depth (BEST_EFFORT): depth_callback → latest_depth_frame 버퍼 갱신
+        - Info  (RELIABLE)   : info_callback  → camera_info 1회 저장
+        '''
+        qos_be = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
             history=HistoryPolicy.KEEP_LAST,
             depth=1
         )
-        self.create_subscription(CompressedImage, TOPIC_RGB, self.image_callback, qos)
-        self.get_logger().info(f"Subscribing to: {TOPIC_RGB}")
+
+        # RGB 구독 (기존 동일)
+        self.create_subscription(CompressedImage, TOPIC_RGB, self.image_callback, qos_be)
+        self.get_logger().info(f"Subscribing RGB  : {TOPIC_RGB}")
+
+        # ── [추가] Depth 구독 ──────────────────────────
+        self.create_subscription(CompressedImage, TOPIC_DEPTH, self.depth_callback, qos_be)
+        self.get_logger().info(f"Subscribing Depth: {TOPIC_DEPTH}")
+
+        # ── [추가] CameraInfo 구독 (RELIABLE: latched topic 대응) ──
+        qos_rel = QoSProfile(
+            reliability=ReliabilityPolicy.RELIABLE,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1
+        )
+        self.create_subscription(CameraInfo, TOPIC_INFO, self.info_callback, qos_rel)
+        self.get_logger().info(f"Subscribing Info : {TOPIC_INFO}")
+
+    # ── [추가] Depth 콜백 ────────────────────────────
+
+    def depth_callback(self, msg: CompressedImage):
+        '''
+        OAK-D compressedDepth 수신 → latest_depth_frame 버퍼 갱신.
+
+        포맷: PNG 헤더(12 bytes 커스텀) + PNG 바디 → uint16 depth map (단위: mm)
+        PNG 시그니처(\x89PNG)를 탐색해 오프셋을 자동 결정한 뒤 디코딩.
+        image_callback에서 _depth_lock으로 안전하게 읽어 사용 가능.
+        '''
+        try:
+            raw = np.frombuffer(bytes(msg.data), dtype=np.uint8)
+
+            # PNG 시그니처 위치 탐색 (최대 16바이트 내)
+            png_start = 0
+            for i in range(min(16, len(raw) - 4)):
+                if (raw[i]   == 0x89 and raw[i+1] == 0x50 and
+                        raw[i+2] == 0x4E and raw[i+3] == 0x47):
+                    png_start = i
+                    break
+
+            depth_img = cv2.imdecode(raw[png_start:], cv2.IMREAD_UNCHANGED)
+
+            if depth_img is None:
+                self.get_logger().warn("[DEBUG-D1] Depth decode failed.")
+                return
+
+            with self._depth_lock:
+                self.latest_depth_frame = depth_img  # uint16, mm 단위
+
+        except Exception as e:
+            self.get_logger().warn(f"[DEBUG-D2] depth_callback error: {e}")
+
+    # ── [추가] CameraInfo 콜백 ──────────────────────
+
+    def info_callback(self, msg: CameraInfo):
+        '''
+        카메라 내부 파라미터(fx, fy, cx, cy)를 1회만 저장.
+        이후 메시지는 무시 (재저장 불필요).
+
+        msg.k 레이아웃 (3×3 row-major):
+            [fx,  0, cx,
+              0, fy, cy,
+              0,  0,  1]
+        '''
+        if self.camera_info is not None:
+            return  # 이미 저장됨 → 무시
+
+        self.camera_info = {
+            "fx":     msg.k[0],
+            "fy":     msg.k[4],
+            "cx":     msg.k[2],
+            "cy":     msg.k[5],
+            "width":  msg.width,
+            "height": msg.height,
+        }
+        self.get_logger().info(
+            f"[INFO] CameraInfo saved — "
+            f"fx={self.camera_info['fx']:.2f}, fy={self.camera_info['fy']:.2f}, "
+            f"cx={self.camera_info['cx']:.2f}, cy={self.camera_info['cy']:.2f}, "
+            f"res={self.camera_info['width']}×{self.camera_info['height']}"
+        )
 
     # ── 메인 파이프라인 ──────────────────────────
 
