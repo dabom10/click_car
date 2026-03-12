@@ -188,6 +188,12 @@ class ParkingDetectionNode(Node):
             f"[DEBUG-4] Detect result — cars: {len(cars)}, plates: {len(ids)}"
         )
 
+        # ── 탐지된 모든 bbox 중심점의 depth + 3D 좌표 로그 ──
+        with self._depth_lock:
+            depth_snap = self.latest_depth_frame  # 레퍼런스만 복사 (락 최소화)
+        for det in cars + ids:
+            self._log_depth_at_center(det, depth_snap)
+
         validated_pairs = []
         for id_det in ids:
             car = self._find_parent_car(id_det, cars)
@@ -211,6 +217,37 @@ class ParkingDetectionNode(Node):
 
         self._update_tracking(frame, validated_pairs)
         self._draw(frame)
+
+    # ── bbox 중심점 depth + 3D 좌표 로그 ────────────
+
+    def _log_depth_at_center(self, det: dict, depth_frame: np.ndarray | None):
+        cx  = (det["x1"] + det["x2"]) // 2
+        cy  = (det["y1"] + det["y2"]) // 2
+        lbl = det["class_name"]
+
+        if depth_frame is None:
+            self.get_logger().info(f"[DEPTH] {lbl} pixel=({cx},{cy}) NO_DATA"); return
+
+        h, w = depth_frame.shape[:2]
+        if not (0 <= cy < h and 0 <= cx < w):
+            self.get_logger().warn(f"[DEPTH] {lbl} pixel=({cx},{cy}) OUT_OF_FRAME"); return
+
+        depth_mm = int(depth_frame[cy, cx])
+        if depth_mm == 0:
+            self.get_logger().info(f"[DEPTH] {lbl} pixel=({cx},{cy}) INVALID"); return
+
+        Z = depth_mm / 1000.0                  # mm → m
+
+        if self.camera_info is None:
+            self.get_logger().info(f"[DEPTH] {lbl} pixel=({cx},{cy}) Z={Z:.2f}m NO_CAM_INFO"); return
+
+        X = (cx - self.camera_info["cx"]) * Z / self.camera_info["fx"]
+        Y = (cy - self.camera_info["cy"]) * Z / self.camera_info["fy"]
+
+        self.get_logger().info(
+            f"[DEPTH] {lbl} pixel=({cx},{cy}) "
+            f"X={X:+.3f}m Y={Y:+.3f}m Z={Z:.3f}m"
+        )
 
     # ── YOLO 탐지 ───────────────────────────────
 
