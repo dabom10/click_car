@@ -1,34 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-
-'''
-[프로젝트: Click Car - AMR 카메라 기반 불법주정차 단속 노드]
-- 최종 수정: 2026-03-11
-
-[System Architecture & Role]
-1. 수신: OAK-D RGB 카메라로부터 CompressedImage 수신 (ROS2)
-2. 탐지: YOLOv8 기반 차량(car) + 번호판(id) 동시 탐지
-3. 검증: 번호판이 차량 영역 내부에 있는지 Overlap 검증
-4. 추적: IoU 기반 동일 차량 식별 + 30초 타이머 관리
-5. 송신 1: car+id 동시 탐지 첫 프레임 → 차량 전체 이미지(base64) 즉시 DB 저장 (증빙용)
-6. 송신 2: 30초 초과 시 번호판 크롭 이미지(base64) DB 저장 (단속용)
-
-[Interface 정의]
-- Topic (Sub): /{NS}/oakd/rgb/image_raw/compressed [sensor_msgs/CompressedImage]
-- Topic (Sub): /{NS}/oakd/stereo/image_raw/compressedDepth [sensor_msgs/CompressedImage]  ← 추가
-- Topic (Sub): /{NS}/oakd/stereo/camera_info [sensor_msgs/CameraInfo]                     ← 추가
-- Database (Out): Firebase Realtime Database
-  * 경로: detections/{timestamp}
-  * 타입 car  : { type, detected_at, car_conf, id_conf, car_bbox, id_bbox, image_base64 }
-  * 타입 plate: { type, detected_at, car_conf, id_conf, car_bbox, id_bbox, image_base64 }
-
-[업로드 로직]
-- car+id 동시 탐지 첫 프레임 → type="car"   로 프레임 전체 이미지 즉시 업로드
-- 30초 초과 시              → type="plate" 로 번호판 크롭 이미지 업로드
-- 동일 차량 판별: car bbox IoU >= CAR_IOU_THRESH
-- 프레임에서 사라지면 즉시 타이머 리셋 (TrackedVehicle 삭제)
-- car 이미지는 TrackedVehicle 생성 시 1회만 업로드 (car_uploaded 플래그로 중복 방지)
-'''
+# [Click Car] AMR 불법주정차 단속 노드
+# - 첫 탐지 시  : 전체 프레임(type=car)   즉시 Firebase 저장 (증빙용)
+# - 30초 초과 시: 번호판 크롭(type=plate) Firebase 저장   (단속용)
+# Sub: RGB / Depth / CameraInfo  |  Out: Firebase detections/{timestamp}
 
 import base64
 import datetime
@@ -41,7 +16,8 @@ import numpy as np
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
-from sensor_msgs.msg import CompressedImage, CameraInfo  # ← CameraInfo 추가
+from sensor_msgs.msg import CompressedImage, CameraInfo, Image
+from cv_bridge import CvBridge
 from ultralytics import YOLO
 import firebase_admin
 from firebase_admin import credentials, db
@@ -63,36 +39,23 @@ YOLO_IMG_SIZE            = 704
 PARKING_TIMEOUT_SEC      = 30.0
 SAVE_QUEUE_MAXSIZE       = 10
 
-# ── 토픽 경로 ──────────────────────────────────
 TOPIC_RGB   = f"{ROBOT_NAMESPACE}/oakd/rgb/image_raw/compressed"
-TOPIC_DEPTH = f"{ROBOT_NAMESPACE}/oakd/stereo/image_raw/compressedDepth"
+TOPIC_DEPTH = f"{ROBOT_NAMESPACE}/oakd/stereo/image_raw"          # raw Image (compressedDepth → image_raw)
 TOPIC_INFO  = f"{ROBOT_NAMESPACE}/oakd/stereo/camera_info"
-
 
 # ──────────────────────────────────────────────
 # [CHAPTER 2: 차량 트래킹 상태 컨테이너]
 # ──────────────────────────────────────────────
 
 class TrackedVehicle:
-    '''
-    단일 차량의 타이머 + 최신 탐지 정보를 보관하는 상태 객체.
-
-    Attributes:
-        first_seen    : car+id 동시 탐지된 최초 시각 (time.monotonic 기준)
-        last_seen     : 마지막으로 프레임에서 확인된 시각
-        car_det       : 차량 탐지 dict (bbox, conf 포함)
-        id_det        : 번호판 탐지 dict
-        car_uploaded  : 차량 전체 이미지 업로드 완료 여부 (첫 프레임 1회만)
-        plate_uploaded: 번호판 크롭 이미지 업로드 완료 여부 (30초 후 1회만)
-    '''
     def __init__(self, car_det: dict, id_det: dict):
         now                  = time.monotonic()
         self.first_seen      = now
         self.last_seen       = now
         self.car_det         = car_det
         self.id_det          = id_det
-        self.car_uploaded    = False   # 증빙용 차량 이미지 업로드 여부
-        self.plate_uploaded  = False   # 단속용 번호판 이미지 업로드 여부
+        self.car_uploaded    = False   # 전체 프레임 업로드 여부 (1회)
+        self.plate_uploaded  = False   # 번호판 크롭 업로드 여부  (1회)
 
     def elapsed(self) -> float:
         return time.monotonic() - self.first_seen
@@ -102,33 +65,22 @@ class TrackedVehicle:
         self.car_det   = car_det
         self.id_det    = id_det
 
-
 # ──────────────────────────────────────────────
 # [CHAPTER 3: 메인 노드]
 # ──────────────────────────────────────────────
 
 class ParkingDetectionNode(Node):
-    '''
-    AMR 탑재 OAK-D RGB 카메라로 불법주정차 차량을 탐지하고
-    - 첫 탐지 시  : 차량 전체 이미지를 Firebase에 즉시 업로드 (증빙)
-    - 30초 초과 시: 번호판 크롭 이미지를 Firebase에 업로드 (단속)
-
-    스레딩 구조:
-        Main Thread  : ROS2 spin → image_callback → YOLO 추론 → 타이머 갱신 → 큐 투입
-        Worker Thread: save_queue 소비 → Firebase 업로드 (네트워크 I/O 분리)
-    '''
-
     def __init__(self):
         super().__init__("parking_detection_node")
 
-        self.tracked_vehicles = []
-        self.save_queue       = queue.Queue(maxsize=SAVE_QUEUE_MAXSIZE)
-        self.db_ref           = None
-
-        # ── [추가] Depth / CameraInfo 수신 버퍼 ──────
-        self.latest_depth_frame = None  # depth_callback에서 매 프레임 갱신 (uint16, mm)
-        self.camera_info        = None  # info_callback에서 1회 저장
-        self._depth_lock        = threading.Lock()  # depth 버퍼 스레드 안전 접근용
+        self.bridge                = CvBridge()
+        self.tracked_vehicles      = []
+        self.save_queue            = queue.Queue(maxsize=SAVE_QUEUE_MAXSIZE)
+        self.db_ref                = None
+        self.latest_depth_frame    = None          # depth_callback 갱신 (uint16, mm)
+        self.camera_info           = None          # info_callback 1회 저장
+        self._depth_lock           = threading.Lock()
+        self._depth_no_data_warned = False         # NO_DATA 경고 1회만 출력
 
         self._load_model()
         self._init_firebase()
@@ -142,9 +94,8 @@ class ParkingDetectionNode(Node):
     # ── 초기화 ──────────────────────────────────
 
     def _load_model(self):
-        ''' YOLO 로드 + Cold Start 방지 워밍업 '''
         self.model = YOLO(MODEL_PATH)
-        self.model.predict(
+        self.model.predict(                     # Cold Start 방지 워밍업
             source=np.zeros((YOLO_IMG_SIZE, YOLO_IMG_SIZE, 3), dtype=np.uint8),
             imgsz=YOLO_IMG_SIZE, verbose=False
         )
@@ -152,7 +103,6 @@ class ParkingDetectionNode(Node):
         self.get_logger().info("YOLO warm-up complete.")
 
     def _init_firebase(self):
-        ''' Firebase Admin SDK 세션 생성. 실패 시 db_ref=None 유지 (업로드 스킵). '''
         try:
             firebase_admin.initialize_app(
                 credentials.Certificate(FIREBASE_CRED_PATH),
@@ -164,85 +114,46 @@ class ParkingDetectionNode(Node):
             self.get_logger().error(f"[DEBUG-2] Firebase init failed: {e}")
 
     def _init_subscriber(self):
-        '''
-        카메라 토픽 3종 구독.
-        - RGB   (BEST_EFFORT): image_callback → YOLO 추론 메인 파이프라인
-        - Depth (BEST_EFFORT): depth_callback → latest_depth_frame 버퍼 갱신
-        - Info  (RELIABLE)   : info_callback  → camera_info 1회 저장
-        '''
+        # RGB : BEST_EFFORT  |  Depth(raw Image) : BEST_EFFORT  |  CameraInfo : RELIABLE
         qos_be = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
             history=HistoryPolicy.KEEP_LAST,
             depth=1
         )
-
-        # RGB 구독 (기존 동일)
-        self.create_subscription(CompressedImage, TOPIC_RGB, self.image_callback, qos_be)
-        self.get_logger().info(f"Subscribing RGB  : {TOPIC_RGB}")
-
-        # ── [추가] Depth 구독 ──────────────────────────
-        self.create_subscription(CompressedImage, TOPIC_DEPTH, self.depth_callback, qos_be)
-        self.get_logger().info(f"Subscribing Depth: {TOPIC_DEPTH}")
-
-        # ── [추가] CameraInfo 구독 (RELIABLE: latched topic 대응) ──
         qos_rel = QoSProfile(
             reliability=ReliabilityPolicy.RELIABLE,
             history=HistoryPolicy.KEEP_LAST,
             depth=1
         )
-        self.create_subscription(CameraInfo, TOPIC_INFO, self.info_callback, qos_rel)
+        self.create_subscription(CompressedImage, TOPIC_RGB,   self.image_callback, qos_be)
+        self.create_subscription(Image,           TOPIC_DEPTH, self.depth_callback, qos_be)
+        self.create_subscription(CameraInfo,      TOPIC_INFO,  self.info_callback,  qos_rel)
+        self.get_logger().info(f"Subscribing RGB  : {TOPIC_RGB}")
+        self.get_logger().info(f"Subscribing Depth: {TOPIC_DEPTH}")
         self.get_logger().info(f"Subscribing Info : {TOPIC_INFO}")
 
-    # ── [추가] Depth 콜백 ────────────────────────────
+    # ── Depth 콜백 ───────────────────────────────
 
-    def depth_callback(self, msg: CompressedImage):
-        '''
-        OAK-D compressedDepth 수신 → latest_depth_frame 버퍼 갱신.
-
-        포맷: PNG 헤더(12 bytes 커스텀) + PNG 바디 → uint16 depth map (단위: mm)
-        PNG 시그니처(\x89PNG)를 탐색해 오프셋을 자동 결정한 뒤 디코딩.
-        image_callback에서 _depth_lock으로 안전하게 읽어 사용 가능.
-        '''
+    def depth_callback(self, msg: Image):
+        # raw Image → CvBridge passthrough → uint16 (mm)
         try:
-            raw = np.frombuffer(bytes(msg.data), dtype=np.uint8)
-
-            # PNG 시그니처 위치 탐색 (최대 16바이트 내)
-            png_start = 0
-            for i in range(min(16, len(raw) - 4)):
-                if (raw[i]   == 0x89 and raw[i+1] == 0x50 and
-                        raw[i+2] == 0x4E and raw[i+3] == 0x47):
-                    png_start = i
-                    break
-
-            depth_img = cv2.imdecode(raw[png_start:], cv2.IMREAD_UNCHANGED)
-
-            if depth_img is None:
+            depth_img = self.bridge.imgmsg_to_cv2(msg, desired_encoding='passthrough')
+            if depth_img is None or depth_img.size == 0:
                 self.get_logger().warn("[DEBUG-D1] Depth decode failed.")
                 return
-
             with self._depth_lock:
-                self.latest_depth_frame = depth_img  # uint16, mm 단위
-
+                self.latest_depth_frame = depth_img
         except Exception as e:
             self.get_logger().warn(f"[DEBUG-D2] depth_callback error: {e}")
 
-    # ── [추가] CameraInfo 콜백 ──────────────────────
+    # ── CameraInfo 콜백 ──────────────────────────
 
     def info_callback(self, msg: CameraInfo):
-        '''
-        카메라 내부 파라미터(fx, fy, cx, cy)를 1회만 저장.
-        이후 메시지는 무시 (재저장 불필요).
-
-        msg.k 레이아웃 (3×3 row-major):
-            [fx,  0, cx,
-              0, fy, cy,
-              0,  0,  1]
-        '''
         if self.camera_info is not None:
-            return  # 이미 저장됨 → 무시
+            return                              # 1회만 저장, 이후 무시
 
         self.camera_info = {
-            "fx":     msg.k[0],
+            "fx":     msg.k[0],                # k 행렬 (3×3 row-major)
             "fy":     msg.k[4],
             "cx":     msg.k[2],
             "cy":     msg.k[5],
@@ -259,30 +170,30 @@ class ParkingDetectionNode(Node):
     # ── 메인 파이프라인 ──────────────────────────
 
     def image_callback(self, msg: CompressedImage):
-        '''
-        Bytes → NumPy 디코딩 → YOLO 추론 → Overlap 검증 → 트래킹/타이머 → 큐 투입
-        '''
         frame = cv2.imdecode(np.array(msg.data, dtype=np.uint8), cv2.IMREAD_COLOR)
         if frame is None:
             self.get_logger().warn("[DEBUG-3] Frame decode failed. Check topic format.")
             return
 
         cars, ids = self._detect(frame)
-
         self.get_logger().info(
             f"[DEBUG-4] Detect result — cars: {len(cars)}, plates: {len(ids)}"
         )
 
+        # ── 탐지된 모든 bbox 중심점의 depth + 3D 좌표 로그 ──
+        with self._depth_lock:
+            depth_snap = self.latest_depth_frame  # 레퍼런스만 복사 (락 최소화)
+        for det in cars + ids:
+            self._log_depth_at_center(det, depth_snap)
+
         validated_pairs = []
         for id_det in ids:
             car = self._find_parent_car(id_det, cars)
-
             self.get_logger().info(
                 f"[DEBUG-5] Plate conf={id_det['conf']:.2f} "
                 f"bbox=({id_det['x1']},{id_det['y1']},{id_det['x2']},{id_det['y2']}) "
                 f"→ parent_car={'FOUND' if car else 'NONE'}"
             )
-
             if car is None:
                 if cars:
                     id_area = max(1, id_det["area"])
@@ -294,19 +205,48 @@ class ParkingDetectionNode(Node):
                             f"[DEBUG-6]   car[{i}] overlap={ov:.3f} / threshold={ID_IN_CAR_OVERLAP_THRESH}"
                         )
                 continue
-
             validated_pairs.append((car, id_det))
 
         self._update_tracking(frame, validated_pairs)
         self._draw(frame)
 
+    # ── bbox 중심점 depth + 3D 좌표 로그 ────────────
+
+    def _log_depth_at_center(self, det: dict, depth_frame: np.ndarray | None):
+        cx  = (det["x1"] + det["x2"]) // 2
+        cy  = (det["y1"] + det["y2"]) // 2
+        lbl = det["class_name"]
+
+        if depth_frame is None:
+            if not self._depth_no_data_warned:
+                self.get_logger().warn("[DEPTH] depth frame not yet received. NO_DATA logs suppressed.")
+                self._depth_no_data_warned = True
+            return
+
+        h, w = depth_frame.shape[:2]
+        if not (0 <= cy < h and 0 <= cx < w):
+            self.get_logger().warn(f"[DEPTH] {lbl} pixel=({cx},{cy}) OUT_OF_FRAME"); return
+
+        depth_mm = int(depth_frame[cy, cx])
+        if depth_mm == 0:
+            self.get_logger().info(f"[DEPTH] {lbl} pixel=({cx},{cy}) INVALID"); return
+
+        Z = depth_mm / 1000.0                  # mm → m
+
+        if self.camera_info is None:
+            self.get_logger().info(f"[DEPTH] {lbl} pixel=({cx},{cy}) Z={Z:.2f}m NO_CAM_INFO"); return
+
+        X = (cx - self.camera_info["cx"]) * Z / self.camera_info["fx"]
+        Y = (cy - self.camera_info["cy"]) * Z / self.camera_info["fy"]
+
+        self.get_logger().info(
+            f"[DEPTH] {lbl} pixel=({cx},{cy}) "
+            f"X={X:+.3f}m Y={Y:+.3f}m Z={Z:.3f}m"
+        )
+
     # ── YOLO 탐지 ───────────────────────────────
 
     def _detect(self, frame: np.ndarray) -> tuple[list, list]:
-        '''
-        YOLOv8 추론.
-        반환: (cars, ids) — 각각 탐지 dict 리스트
-        '''
         results = self.model.predict(source=frame, imgsz=YOLO_IMG_SIZE,
                                      conf=CONF_THRESHOLD, verbose=False)
         cars, ids = [], []
@@ -331,10 +271,7 @@ class ParkingDetectionNode(Node):
     # ── Overlap 검증 ────────────────────────────
 
     def _find_parent_car(self, id_det: dict, cars: list) -> dict | None:
-        '''
-        번호판(id_det)이 어느 차량(cars) 내부에 속하는지 Overlap 비율로 판별.
-        알고리즘: intersection(id, car) / area(id) >= ID_IN_CAR_OVERLAP_THRESH
-        '''
+        # intersection(id, car) / area(id) >= 임계값 → 번호판이 차량 내부
         id_area = max(1, id_det["area"])
 
         def overlap(car):
@@ -361,17 +298,10 @@ class ParkingDetectionNode(Node):
     # ── 트래킹 갱신 + 타이머 관리 ──────────────────
 
     def _update_tracking(self, frame: np.ndarray, validated_pairs: list):
-        '''
-        1. 기존 TrackedVehicle ↔ 현재 validated_pairs IoU 매칭
-           - 매칭 성공 → bbox·conf 갱신
-           - 매칭 실패 → 새 TrackedVehicle 생성 + 차량 전체 이미지 즉시 큐 투입
-        2. 사라진 트래킹 즉시 삭제 (타이머 리셋)
-        3. 30초 초과 → 번호판 크롭 큐 투입 후 트래킹 종료
-        '''
         matched_track_indices = set()
         matched_pair_indices  = set()
 
-        # Step 1: 기존 트래킹 ↔ 현재 프레임 매칭
+        # Step1: 기존 트래킹 ↔ 현재 프레임 IoU 매칭
         for t_idx, track in enumerate(self.tracked_vehicles):
             best_iou   = 0.0
             best_p_idx = -1
@@ -389,54 +319,46 @@ class ParkingDetectionNode(Node):
                 matched_track_indices.add(t_idx)
                 matched_pair_indices.add(best_p_idx)
 
-        # Step 2: 사라진 트래킹 제거 (타이머 리셋)
+        # Step2: 사라진 트래킹 제거 (타이머 리셋)
         visible_tracks = [
             track for i, track in enumerate(self.tracked_vehicles)
             if i in matched_track_indices
         ]
 
-        # Step 3: 신규 차량 → TrackedVehicle 생성 + 차량 전체 이미지 즉시 업로드
+        # Step3: 신규 차량 → TrackedVehicle 생성 + 전체 프레임 즉시 업로드
         for p_idx, (car_det, id_det) in enumerate(validated_pairs):
             if p_idx not in matched_pair_indices:
                 new_track = TrackedVehicle(car_det, id_det)
                 visible_tracks.append(new_track)
                 self.get_logger().info("New vehicle tracking started.")
-
-                # ── 증빙용 차량 전체 이미지 즉시 큐 투입 ──
                 self._enqueue_car(frame, new_track)
                 new_track.car_uploaded = True
 
-        # Step 4: 30초 초과 체크 → 번호판 크롭 큐 투입
+        # Step4: 30초 초과 → 번호판 크롭 업로드 후 트래킹 종료
         next_tracks = []
         for track in visible_tracks:
             if track.plate_uploaded:
                 continue
-
             elapsed = track.elapsed()
             self.get_logger().info(
                 f"Tracking: elapsed={elapsed:.1f}s / {PARKING_TIMEOUT_SEC}s"
             )
-
             if elapsed >= PARKING_TIMEOUT_SEC:
                 self._enqueue_plate(frame, track)
                 track.plate_uploaded = True
-                # 번호판 업로드 완료 → 트래킹 종료
             else:
                 next_tracks.append(track)
 
         self.tracked_vehicles = next_tracks
 
-    # ── Firebase 큐 투입 (차량 전체 이미지) ──────────
+    # ── Firebase 큐 투입 ─────────────────────────
 
     def _enqueue_car(self, frame: np.ndarray, track: TrackedVehicle):
-        '''
-        증빙용: 차량이 처음 탐지된 프레임 전체를 큐에 투입.
-        type="car" 로 저장되어 차주 증빙 자료로 활용.
-        '''
+        # type=car: 전체 프레임 (증빙용), 1회만 투입
         try:
             self.save_queue.put_nowait({
                 "type":    "car",
-                "image":   frame.copy(),   # 프레임 전체
+                "image":   frame.copy(),
                 "car_det": track.car_det,
                 "id_det":  track.id_det,
             })
@@ -446,13 +368,8 @@ class ParkingDetectionNode(Node):
         except queue.Full:
             self.get_logger().warn("Queue full. Car image dropped.")
 
-    # ── Firebase 큐 투입 (번호판 크롭) ──────────────
-
     def _enqueue_plate(self, frame: np.ndarray, track: TrackedVehicle):
-        '''
-        단속용: 30초 초과 시 번호판 bbox 크롭을 큐에 투입.
-        type="plate" 로 저장.
-        '''
+        # type=plate: 번호판 크롭 (단속용), 30초 후 1회 투입
         id_det = track.id_det
         x1, y1, x2, y2 = id_det["x1"], id_det["y1"], id_det["x2"], id_det["y2"]
         crop = frame[y1:y2, x1:x2]
@@ -466,7 +383,7 @@ class ParkingDetectionNode(Node):
         try:
             self.save_queue.put_nowait({
                 "type":    "plate",
-                "image":   crop.copy(),    # 번호판 크롭
+                "image":   crop.copy(),
                 "car_det": track.car_det,
                 "id_det":  track.id_det,
             })
@@ -485,20 +402,17 @@ class ParkingDetectionNode(Node):
             elapsed = track.elapsed()
             ratio   = min(elapsed / PARKING_TIMEOUT_SEC, 1.0)
 
-            # 차량 bbox (초록)
             cv2.rectangle(frame, (c["x1"], c["y1"]), (c["x2"], c["y2"]), (0, 255, 0), 2)
             cv2.putText(frame, f"car {c['conf']:.2f}",
                         (c["x1"], max(25, c["y1"] - 30)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
 
-            # 번호판 bbox (빨강)
             d = track.id_det
             cv2.rectangle(frame, (d["x1"], d["y1"]), (d["x2"], d["y2"]), (0, 0, 255), 2)
             cv2.putText(frame, f"id {d['conf']:.2f}",
                         (d["x1"], max(25, d["y1"] - 10)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
 
-            # 타이머 진행 바
             bar_x1    = c["x1"]
             bar_y     = max(0, c["y1"] - 18)
             bar_w     = c["x2"] - c["x1"]
@@ -510,7 +424,6 @@ class ParkingDetectionNode(Node):
                         (bar_x1, bar_y - 4),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.45, bar_color, 1)
 
-        # 큐 상태 HUD (우상단)
         q_size  = self.save_queue.qsize()
         q_ratio = q_size / max(1, SAVE_QUEUE_MAXSIZE)
         q_color = (0, 255, 0) if q_ratio < 0.5 else (0, 165, 255) if q_ratio < 1.0 else (0, 0, 255)
@@ -518,8 +431,6 @@ class ParkingDetectionNode(Node):
         (tw, _), _ = cv2.getTextSize(q_text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
         cv2.putText(frame, q_text, (frame.shape[1] - tw - 10, 25),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, q_color, 2)
-
-        # 트래킹 수 (좌상단)
         cv2.putText(frame, f"Tracking: {len(self.tracked_vehicles)}",
                     (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
 
@@ -529,11 +440,7 @@ class ParkingDetectionNode(Node):
     # ── Firebase 업로드 워커 ─────────────────────
 
     def _upload_worker(self):
-        '''
-        save_queue를 소비하며 Firebase에 직렬화 전송.
-        None 수신 시 종료 (Sentinel 패턴).
-        item["type"] 으로 car / plate 구분하여 저장.
-        '''
+        # save_queue 소비 → Firebase 업로드 / None 수신 시 종료 (Sentinel 패턴)
         while True:
             item = self.save_queue.get()
             if item is None:
@@ -544,16 +451,10 @@ class ParkingDetectionNode(Node):
                 self.get_logger().error(f"Upload error: {e}")
 
     def _upload(self, item: dict):
-        '''
-        공통 업로드 함수.
-        - type="car"  : 프레임 전체 이미지 → 증빙용
-        - type="plate": 번호판 크롭 이미지 → 단속용
-        경로: detections/{timestamp}
-        '''
+        # type=car: 전체 프레임 / type=plate: 번호판 크롭 → detections/{timestamp}
         if self.db_ref is None:
             self.get_logger().error(
-                "[DEBUG-7] db_ref is None — Firebase 미연결. "
-                "시작 로그의 [DEBUG-2] 확인 필요."
+                "[DEBUG-7] db_ref is None — Firebase 미연결. [DEBUG-2] 확인 필요."
             )
             return
 
@@ -567,7 +468,7 @@ class ParkingDetectionNode(Node):
 
         now = datetime.datetime.now()
         self.db_ref.child(now.strftime("%Y%m%d_%H%M%S_%f")).set({
-            "type":           upload_type,           # "car" or "plate"
+            "type":           upload_type,
             "detected_at":    now.isoformat(),
             "car_confidence": round(car_det["conf"], 4),
             "id_confidence":  round(id_det["conf"], 4),
@@ -584,8 +485,7 @@ class ParkingDetectionNode(Node):
     # ── 종료 ────────────────────────────────────
 
     def destroy_node(self):
-        ''' Sentinel(None) 전송으로 워커 스레드 안전 종료 후 GUI 해제. '''
-        self.save_queue.put(None)
+        self.save_queue.put(None)   # 워커 스레드 안전 종료
         cv2.destroyAllWindows()
         super().destroy_node()
 
