@@ -16,7 +16,8 @@ import numpy as np
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
-from sensor_msgs.msg import CompressedImage, CameraInfo
+from sensor_msgs.msg import CompressedImage, CameraInfo, Image
+from cv_bridge import CvBridge
 from ultralytics import YOLO
 import firebase_admin
 from firebase_admin import credentials, db
@@ -39,7 +40,7 @@ PARKING_TIMEOUT_SEC      = 30.0
 SAVE_QUEUE_MAXSIZE       = 10
 
 TOPIC_RGB   = f"{ROBOT_NAMESPACE}/oakd/rgb/image_raw/compressed"
-TOPIC_DEPTH = f"{ROBOT_NAMESPACE}/oakd/stereo/image_raw/compressedDepth"
+TOPIC_DEPTH = f"{ROBOT_NAMESPACE}/oakd/stereo/image_raw"          # raw Image (compressedDepth → image_raw)
 TOPIC_INFO  = f"{ROBOT_NAMESPACE}/oakd/stereo/camera_info"
 
 # ──────────────────────────────────────────────
@@ -72,9 +73,10 @@ class ParkingDetectionNode(Node):
     def __init__(self):
         super().__init__("parking_detection_node")
 
-        self.tracked_vehicles   = []
-        self.save_queue         = queue.Queue(maxsize=SAVE_QUEUE_MAXSIZE)
-        self.db_ref             = None
+        self.bridge                = CvBridge()
+        self.tracked_vehicles      = []
+        self.save_queue            = queue.Queue(maxsize=SAVE_QUEUE_MAXSIZE)
+        self.db_ref                = None
         self.latest_depth_frame    = None          # depth_callback 갱신 (uint16, mm)
         self.camera_info           = None          # info_callback 1회 저장
         self._depth_lock           = threading.Lock()
@@ -112,7 +114,7 @@ class ParkingDetectionNode(Node):
             self.get_logger().error(f"[DEBUG-2] Firebase init failed: {e}")
 
     def _init_subscriber(self):
-        # RGB / Depth : BEST_EFFORT  |  CameraInfo : RELIABLE (latched 대응)
+        # RGB : BEST_EFFORT  |  Depth(raw Image) : BEST_EFFORT  |  CameraInfo : RELIABLE
         qos_be = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
             history=HistoryPolicy.KEEP_LAST,
@@ -124,7 +126,7 @@ class ParkingDetectionNode(Node):
             depth=1
         )
         self.create_subscription(CompressedImage, TOPIC_RGB,   self.image_callback, qos_be)
-        self.create_subscription(CompressedImage, TOPIC_DEPTH, self.depth_callback, qos_be)
+        self.create_subscription(Image,           TOPIC_DEPTH, self.depth_callback, qos_be)
         self.create_subscription(CameraInfo,      TOPIC_INFO,  self.info_callback,  qos_rel)
         self.get_logger().info(f"Subscribing RGB  : {TOPIC_RGB}")
         self.get_logger().info(f"Subscribing Depth: {TOPIC_DEPTH}")
@@ -132,26 +134,15 @@ class ParkingDetectionNode(Node):
 
     # ── Depth 콜백 ───────────────────────────────
 
-    def depth_callback(self, msg: CompressedImage):
-        # compressedDepth: 앞 최대 16byte 커스텀 헤더 + PNG 바디 → uint16 depth (mm)
+    def depth_callback(self, msg: Image):
+        # raw Image → CvBridge passthrough → uint16 (mm)
         try:
-            raw = np.frombuffer(bytes(msg.data), dtype=np.uint8)
-
-            png_start = 0                       # PNG 시그니처(\x89PNG) 위치 탐색
-            for i in range(min(16, len(raw) - 4)):
-                if (raw[i]   == 0x89 and raw[i+1] == 0x50 and
-                        raw[i+2] == 0x4E and raw[i+3] == 0x47):
-                    png_start = i
-                    break
-
-            depth_img = cv2.imdecode(raw[png_start:], cv2.IMREAD_UNCHANGED)
-            if depth_img is None:
+            depth_img = self.bridge.imgmsg_to_cv2(msg, desired_encoding='passthrough')
+            if depth_img is None or depth_img.size == 0:
                 self.get_logger().warn("[DEBUG-D1] Depth decode failed.")
                 return
-
             with self._depth_lock:
                 self.latest_depth_frame = depth_img
-
         except Exception as e:
             self.get_logger().warn(f"[DEBUG-D2] depth_callback error: {e}")
 
