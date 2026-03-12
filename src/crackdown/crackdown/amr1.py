@@ -2,15 +2,53 @@
 """
 amr1.py
 -------
-robot3 - 출발 신호 수신 후 순찰 시작
-구역 기반 이동 + 단속 + 도킹 + 재시작 대기
+robot3 기준 테스트 - 출발 신호 수신 후 순찰 시작
+구역 기반 이동 + 단속 + waypoint 9까지 복귀 + 도킹 + 재시작 대기
+
+[전체 동작 흐름]
+  1. start 신호 대기
+  2. 현재의 yaw 값을 추출하고 initial_pose 선정 -> 언독 후 waypoint 순서대로 순찰 (시계 반대 방향)
+  3. cctv_done 또는 amr_done 수신 시 해당 구역 첫 waypoint로 이동
+  4. 구역 첫 waypoint 도착 → 목표 좌표로 이동
+       - CCTV 경로: cctv_start(True) pub → capture_done 대기
+       - AMR 경로:  amr_start(True)  pub → capture_done 대기
+  5. 단속 완료 → 남은 waypoint 순서대로 waypoint 9까지 이동
+  6. Pre-dock 위치로 이동 → 도킹
+  7. 다시 1번으로 (무한 반복)
+
+[단속 출처 구분]
+  CCTV 경로  : cctv_done(x,y) 수신 → 이동 → cctv_start(True) pub → capture_done 대기
+  AMR  경로  : amr_done(x,y)  수신 → 이동 → amr_start(True)  pub → capture_done 대기
+  capture_done은 두 경로 공통 토픽 (동시 단속 없으므로 충돌 없음)
+  단속 시작 직전 capture_done = False 초기화 필수 (잔류값 방지)
+
+[모드 전환]
+  MODE_PATROL
+    └─ cctv_done / amr_done 수신 ──→ MODE_ROUTE_TO_ZONE
+                                          └─ 구역 첫 waypoint 도착 ──→ MODE_ENFORCEMENT
+                                                                          └─ 단속 완료 ──→ MODE_PATROL (stop ON)
+
+[토픽 목록]
+  구독:
+    /{robot_ns}/patrol_command  std_msgs/String        'start' / 'stop'
+    /{robot_ns}/cctv_done       std_msgs/String        'x,y'  ← CCTV 좌표
+    /{robot_ns}/amr_done        std_msgs/String        'x,y'  ← AMR 카메라 좌표
+    /{robot_ns}/capture_done    std_msgs/Bool          촬영 완료 신호 (공통)
+    /{robot_ns}/battery_state   sensor_msgs/BatteryState
+    /{robot_ns}/amcl_pose       geometry_msgs/PoseWithCovarianceStamped
+
+  발행:
+    /{robot_ns}/cctv_start      std_msgs/Bool          True = 촬영 시작 (CCTV 경로)
+    /{robot_ns}/amr_start       std_msgs/Bool          True = 촬영 시작 (AMR 경로)
 
 실행:
   ros2 run crackdown amr1 --ros-args -r __ns:=/robot3
 
-토픽 송신:
+토픽 송신 테스트:
   출발: ros2 topic pub /robot3/patrol_command std_msgs/String "{data: 'start'}" --once
-  이동: ros2 topic pub /robot3/goto_target std_msgs/String "{data: '0.5,-4.7'}" --once
+  CCTV: ros2 topic pub /robot3/cctv_done std_msgs/String "{data: '0.5,-4.7'}" --once
+  AMR:  ros2 topic pub /robot3/amr_done  std_msgs/String "{data: '0.5,-4.7'}" --once
+  촬영완료: ros2 topic pub /robot3/capture_done std_msgs/Bool "{data: true}" --once
   정지: ros2 topic pub /robot3/patrol_command std_msgs/String "{data: 'stop'}" --once
 """
 
@@ -23,19 +61,21 @@ from rclpy.node import Node
 from rclpy.executors import MultiThreadedExecutor
 from turtlebot4_navigation.turtlebot4_navigator import TurtleBot4Directions, TurtleBot4Navigator
 from nav_msgs.msg import Odometry
-from std_msgs.msg import String
+from std_msgs.msg import String, Bool
+from sensor_msgs.msg import BatteryState
+from geometry_msgs.msg import PoseWithCovarianceStamped
 
 # ── 웨이포인트 정의 ──────────────────────────────────────
 WAYPOINTS = [
     ([-0.725, -0.2],  TurtleBot4Directions.WEST),
     ([-0.725,  1.9],  TurtleBot4Directions.SOUTH),
-    ([-2.1,   1.95],  TurtleBot4Directions.EAST),
-    ([-2.15, -0.3],   TurtleBot4Directions.EAST),
-    ([-2.3,  -2.0],   TurtleBot4Directions.EAST),
-    ([-2.4,  -4.0],   TurtleBot4Directions.NORTH),
-    ([ 2.1,  -4.0],   TurtleBot4Directions.WEST),
-    ([ 1.97, -2.5],   TurtleBot4Directions.SOUTH),
-    ([-1.5,  -2.2],   TurtleBot4Directions.WEST),
+    ([-2.2,    2.2],  TurtleBot4Directions.NORTH_EAST),
+    ([-2.15,  -0.3],  TurtleBot4Directions.EAST),
+    ([-2.3,   -2.0],  TurtleBot4Directions.EAST),
+    ([-2.4,   -4.0],  TurtleBot4Directions.NORTH),
+    ([ 2.1,   -4.0],  TurtleBot4Directions.WEST),
+    ([ 1.97,  -2.5],  TurtleBot4Directions.SOUTH),
+    ([-1.5,   -2.2],  TurtleBot4Directions.WEST),
 ]
 
 ZONES = [
@@ -72,25 +112,32 @@ ZONES = [
 ]
 PATROL_ORDER  = [0, 1, 2, 3, 4, 5, 6, 7, 8]
 PATROL_LENGTH = len(PATROL_ORDER)
-FINAL_WAYPOINT_INDEX = 0
 
-# ── robot3 (AMR 1번) 기준 ──────────────────────────
-INITIAL_POSITION  = [0.0, 0.0]      # dock 1 기준
-# INITIAL_POSITION  = [0.1424, 1.769]   # dock 2 기준
+# ── robot3 (AMR 1번) 기준 ─────────────────────────────
+INITIAL_POSITION   = [0.0, 0.0]             # dock 1 기준
+# INITIAL_POSITION = [0.1424, 1.769]        # dock 2 기준
 
-PRE_DOCK_POSITION = [-0.63, -0.20]   # dock 1
-# PRE_DOCK_POSITION  = [-2.5, -1.7]      # dock 2
+PRE_DOCK_POSITION  = [-0.63, -0.20]         # dock 1
+# PRE_DOCK_POSITION = [-2.5, -1.7]          # dock 2
 PRE_DOCK_DIRECTION = TurtleBot4Directions.NORTH
 
-ENFORCEMENT_WAIT   = 10.0  # 단속 대기 시간 (초) - 파라미터로 조정 가능
-TASK_POLL_PERIOD_SEC = 0.1
+ENFORCEMENT_WAIT_CCTV = 10.0   # CCTV 경로 단속 대기 시간 (초)
+ENFORCEMENT_WAIT_AMR  = 30.0   # AMR 카메라 경로 단속 대기 시간 (초)
+ENFORCEMENT_STOP_DIST = 0.7    # 목표 차량으로부터 정지할 거리 (미터) - 조절 가능
+TASK_POLL_PERIOD_SEC  = 0.1
+BATTERY_LOW_THRESHOLD = 0.25   # 배터리 복귀 기준 (25%)
+
+# ================================
+# 단속 출처 상수
+# ================================
+SOURCE_CCTV = "CCTV"
+SOURCE_AMR  = "AMR"
 
 # ================================
 # 모드 상수
 # ================================
 MODE_PATROL        = "PATROL"
 MODE_ROUTE_TO_ZONE = "ROUTE_TO_ZONE"
-MODE_WAIT_RESUME   = "WAIT_RESUME"
 MODE_ENFORCEMENT   = "ENFORCEMENT"
 
 # ================================
@@ -102,6 +149,10 @@ def quaternion_to_yaw(q):
     return math.atan2(siny_cosp, cosy_cosp)
 
 def get_current_yaw(robot_ns):
+    """
+    Odometry 토픽에서 현재 로봇의 yaw 값을 한 번 읽어서 반환.
+    첫 사이클 시작 전(executor 충돌 없는 시점)에만 호출.
+    """
     node = rclpy.create_node('yaw_reader')
     yaw = [None]
 
@@ -154,54 +205,145 @@ def move_to_pre_dock_and_dock(navigator):
     navigator.info('Pre-dock 도착 → 도킹 실행')
     navigator.dock()
 
-def do_enforcement(navigator, target_x, target_y, wait_sec=ENFORCEMENT_WAIT):
-    """목표 좌표로 이동 → 단속 대기"""
-    navigator.info(f'[단속] 목표 좌표 ({target_x}, {target_y}) 로 이동 시작')
-    goal_pose = navigator.getPoseStamped(
-        [target_x, target_y],
-        TurtleBot4Directions.NORTH
+def do_enforcement(navigator, node, target_x, target_y, source):
+    """
+    단속 실행: 목표 좌표 앞 ENFORCEMENT_STOP_DIST 지점으로 이동 후 촬영 대기.
+
+    [출처별 동작]
+      SOURCE_CCTV : 이동 완료 → cctv_start(True) pub → capture_done 대기
+      SOURCE_AMR  : 이동 완료 → amr_start(True)  pub → capture_done 대기
+
+    [방향 계산]
+      node.current_x/y (amcl_pose 콜백으로 지속 갱신) 에서 현재 위치를 읽고
+      atan2로 목표 방향을 계산 → degree 변환 → getPoseStamped에 전달.
+
+    [capture_done 초기화]
+      촬영 시작 pub 직전에 capture_done = False 로 초기화.
+      이전 단속의 잔류 True 값이 즉시 통과하는 버그를 방지.
+    """
+    navigator.info(f'[단속/{source}] 목표 좌표 ({target_x}, {target_y}) 로 이동 시작')
+
+    # 현재 위치 읽기 (amcl_pose 콜백으로 갱신된 공유 변수)
+    with node.state_lock:
+        rx = node.current_x
+        ry = node.current_y
+    navigator.info(f'[단속/{source}] 현재 위치: ({rx:.2f}, {ry:.2f})')
+
+    # 목표 방향 계산: atan2(라디안) → degree 변환
+    yaw_rad = math.atan2(target_y - ry, target_x - rx)
+    yaw_deg = math.degrees(yaw_rad)
+    navigator.info(f'[단속/{source}] 목표 방향: {yaw_deg:.1f}°')
+
+    # 목표에서 ENFORCEMENT_STOP_DIST만큼 앞 정지 좌표 계산
+    stop_x = target_x - math.cos(yaw_rad) * ENFORCEMENT_STOP_DIST
+    stop_y = target_y - math.sin(yaw_rad) * ENFORCEMENT_STOP_DIST
+    navigator.info(
+        f'[단속/{source}] 정지 좌표: ({stop_x:.2f}, {stop_y:.2f}) '
+        f'← 목표에서 {ENFORCEMENT_STOP_DIST}m 앞'
     )
+
+    goal_pose = navigator.getPoseStamped([stop_x, stop_y], yaw_deg)
     navigator.goToPose(goal_pose)
     while not navigator.isTaskComplete():
         time.sleep(TASK_POLL_PERIOD_SEC)
+    navigator.info(f'[단속/{source}] 도착 완료 → 촬영 시작 신호 pub')
 
-    navigator.info(f'[단속] 도착 완료 → {wait_sec}초 단속 대기')
-    time.sleep(wait_sec)
-    navigator.info('[단속] 단속 완료!')
+    # capture_done 잔류값 초기화 후 촬영 시작 신호 pub
+    with node.state_lock:
+        node.capture_done = False
 
-class AMR2Node(Node):
+    if source == SOURCE_CCTV:
+        node.cctv_start_pub.publish(Bool(data=True))
+        navigator.info('[단속/CCTV] cctv_start(True) pub → capture_done 대기')
+    else:
+        node.amr_start_pub.publish(Bool(data=True))
+        navigator.info('[단속/AMR] amr_start(True) pub → capture_done 대기')
+
+    # capture_done True 수신까지 대기
+    while True:
+        with node.state_lock:
+            done = node.capture_done
+        if done:
+            break
+        time.sleep(TASK_POLL_PERIOD_SEC)
+
+    navigator.info(f'[단속/{source}] capture_done 수신 → 단속 완료!')
+
+
+class AMRNode(Node):
     def __init__(self, robot_ns='robot3'):
         super().__init__('amr1_node')
 
-        self.robot_ns = robot_ns
+        self.robot_ns   = robot_ns
         self.state_lock = threading.Lock()
 
-        # ── 탐지 플래그 ──────────────────────────────
+        # ── 순찰 제어 플래그 ─────────────────────────
         self.start_patrol   = False
-        self.goto_requested = False
         self.stop_requested = False
+        self.battery_low    = False
+
+        # ── 단속 요청 플래그 ─────────────────────────
+        # source: SOURCE_CCTV / SOURCE_AMR / None
+        self.goto_requested = False
+        self.goto_source    = None   # 어느 경로에서 수신했는지
         self.target_x       = None
         self.target_y       = None
+
+        # ── 촬영 완료 플래그 ─────────────────────────
+        self.capture_done   = False  # capture_done 토픽 수신 시 True
+
+        # ── 현재 위치 (amcl_pose 콜백으로 갱신) ──────
+        self.current_x      = 0.0
+        self.current_y      = 0.0
 
         # ── Navigator ────────────────────────────────
         self.navigator = TurtleBot4Navigator()
 
-        # ── 탐지 토픽 구독 ───────────────────────────
+        # ── 구독 ─────────────────────────────────────
         self.create_subscription(
             String,
             f'/{robot_ns}/patrol_command',
             self.patrol_command_callback,
             10
         )
-
         self.create_subscription(
             String,
-            f'/{robot_ns}/goto_target',
-            self.goto_target_callback,
+            f'/{robot_ns}/cctv_done',
+            self.cctv_done_callback,
+            10
+        )
+        self.create_subscription(
+            String,
+            f'/{robot_ns}/amr_done',
+            self.amr_done_callback,
+            10
+        )
+        self.create_subscription(
+            Bool,
+            f'/{robot_ns}/capture_done',
+            self.capture_done_callback,
+            10
+        )
+        self.create_subscription(
+            BatteryState,
+            f'/{robot_ns}/battery_state',
+            self.battery_callback,
+            10
+        )
+        self.create_subscription(
+            PoseWithCovarianceStamped,
+            f'/{robot_ns}/amcl_pose',
+            self.amcl_pose_callback,
             10
         )
 
+        # ── 발행 ─────────────────────────────────────
+        self.cctv_start_pub = self.create_publisher(Bool, f'/{robot_ns}/cctv_start', 10)
+        self.amr_start_pub  = self.create_publisher(Bool, f'/{robot_ns}/amr_start',  10)
+
         self.get_logger().info(f'[{robot_ns}] 초기화 완료')
+
+    # ── 콜백 ─────────────────────────────────────────
 
     def patrol_command_callback(self, msg):
         with self.state_lock:
@@ -210,30 +352,86 @@ class AMR2Node(Node):
                 self.get_logger().info('출발 신호 수신 → 순찰 시작!')
             elif msg.data == 'stop':
                 self.stop_requested = True
-                self.get_logger().info('정지 신호 수신 → waypoint 1까지 완료 후 도킹')
+                self.get_logger().info('정지 신호 수신 → waypoint 9까지 완료 후 도킹')
 
-    def goto_target_callback(self, msg):
+    def _parse_coord(self, msg, source_label):
+        """'x,y' 문자열 파싱 공통 함수. 파싱 실패 시 None 반환."""
         try:
             x, y = map(float, msg.data.split(','))
-            with self.state_lock:
-                self.target_x       = x
-                self.target_y       = y
-                self.goto_requested = True
-            self.get_logger().info(f'목표 좌표 수신: x={x}, y={y}')
+            return x, y
         except Exception as e:
-            self.get_logger().error(f'좌표 파싱 실패: {msg.data} → {e}')
+            self.get_logger().error(f'[{source_label}] 좌표 파싱 실패: {msg.data} → {e}')
+            return None, None
+
+    def cctv_done_callback(self, msg):
+        """CCTV에서 목표 좌표 수신. 단속 중(stop_requested)이면 무시."""
+        x, y = self._parse_coord(msg, 'cctv_done')
+        if x is None:
+            return
+        with self.state_lock:
+            if self.stop_requested:
+                self.get_logger().warn('[cctv_done] 단속/복귀 중 → 무시')
+                return
+            self.target_x       = x
+            self.target_y       = y
+            self.goto_source    = SOURCE_CCTV
+            self.goto_requested = True
+        self.get_logger().info(f'[cctv_done] 목표 좌표 수신: ({x}, {y})')
+
+    def amr_done_callback(self, msg):
+        """AMR 카메라에서 목표 좌표 수신. 단속 중(stop_requested)이면 무시."""
+        x, y = self._parse_coord(msg, 'amr_done')
+        if x is None:
+            return
+        with self.state_lock:
+            if self.stop_requested:
+                self.get_logger().warn('[amr_done] 단속/복귀 중 → 무시')
+                return
+            self.target_x       = x
+            self.target_y       = y
+            self.goto_source    = SOURCE_AMR
+            self.goto_requested = True
+        self.get_logger().info(f'[amr_done] 목표 좌표 수신: ({x}, {y})')
+
+    def capture_done_callback(self, msg):
+        """촬영 완료 신호 수신 (CCTV/AMR 경로 공통)."""
+        if msg.data:
+            with self.state_lock:
+                self.capture_done = True
+            self.get_logger().info('[capture_done] 촬영 완료 수신')
+
+    def battery_callback(self, msg):
+        with self.state_lock:
+            if not self.battery_low and msg.percentage < BATTERY_LOW_THRESHOLD:
+                self.battery_low = True
+                self.get_logger().warn(
+                    f'배터리 부족 ({msg.percentage*100:.1f}%) → '
+                    f'현재 작업 완료 후 도킹 복귀'
+                )
+
+    def amcl_pose_callback(self, msg):
+        """
+        amcl_pose 콜백 - 현재 위치를 공유 변수에 지속 갱신.
+        임시 노드로 읽으면 MultiThreadedExecutor와 충돌해 무한 대기하므로
+        노드 멤버로 관리.
+        """
+        with self.state_lock:
+            self.current_x = msg.pose.pose.position.x
+            self.current_y = msg.pose.pose.position.y
+
 
 # ================================
 # 순찰 한 사이클
 # ================================
-def patrol_cycle(node: AMR2Node, is_first_cycle: bool = False):
+def patrol_cycle(node: AMRNode, is_first_cycle: bool = False):
     navigator = node.navigator
 
-    # ── 출발 신호 대기 ────────────────────────────────
     navigator.info('[robot3] 출발 신호 대기 중...')
     with node.state_lock:
-        node.start_patrol = False  # 이전 신호 초기화
+        node.start_patrol   = False
         node.stop_requested = False
+        node.battery_low    = False
+        node.capture_done   = False
 
     while rclpy.ok():
         with node.state_lock:
@@ -241,7 +439,6 @@ def patrol_cycle(node: AMR2Node, is_first_cycle: bool = False):
                 break
         time.sleep(0.1)
 
-    # ── 초기 설정 (첫 사이클만 실행) ─────────────────
     if is_first_cycle:
         if not navigator.getDockedStatus():
             navigator.info('도킹 상태 아님 → 도킹 후 초기 포즈 설정')
@@ -258,67 +455,83 @@ def patrol_cycle(node: AMR2Node, is_first_cycle: bool = False):
 
     target_zone_id                = None
     target_zone_first_index       = None
-    target_zone_first_patrol_pos  = None
     target_zone_resume_patrol_pos = None
     enforcement_x                 = None
     enforcement_y                 = None
+    enforcement_source            = None   # SOURCE_CCTV or SOURCE_AMR
 
     while rclpy.ok():
 
         with node.state_lock:
-            local_goto     = node.goto_requested
-            local_stop     = node.stop_requested
-            local_target_x = node.target_x
-            local_target_y = node.target_y
+            local_goto        = node.goto_requested
+            local_stop        = node.stop_requested
+            local_battery_low = node.battery_low
+            local_target_x    = node.target_x
+            local_target_y    = node.target_y
+            local_source      = node.goto_source
 
-        # ── 단속 모드: 단속 실행 후 waypoint 1까지 복귀
+        # 배터리 부족 → stop과 동일하게 처리
+        if local_battery_low and not local_stop:
+            with node.state_lock:
+                node.stop_requested = True
+            local_stop = True
+            navigator.warn('[배터리] 부족 → 현재 작업 완료 후 도킹 복귀')
+
+        # ── 단속 실행 ────────────────────────────────
         if current_mode == MODE_ENFORCEMENT:
-            do_enforcement(navigator, enforcement_x, enforcement_y, wait_sec=ENFORCEMENT_WAIT)
-
-            # 단속 완료 → stop 플래그 ON → waypoint 1까지 이동 후 도킹
+            do_enforcement(
+                navigator, node,
+                enforcement_x, enforcement_y,
+                source=enforcement_source
+            )
             with node.state_lock:
                 node.stop_requested = True
             current_mode = MODE_PATROL
             navigator.info(
                 f'단속 완료 → '
                 f'waypoint {patrol_pos_to_waypoint_index(patrol_pos)+1} 부터 '
-                f'waypoint 1까지 이동 후 도킹'
+                f'waypoint 9까지 이동 후 도킹'
             )
             continue
 
-        # ── 목표 좌표 요청 처리 ──────────────────────
-        if local_goto and current_mode != MODE_ROUTE_TO_ZONE:
+        # ── 단속 요청 처리 ───────────────────────────
+        if local_goto and current_mode != MODE_ROUTE_TO_ZONE and not local_stop:
             zone = find_zone_by_point(local_target_x, local_target_y)
             if zone is None:
-                navigator.info(f'좌표 ({local_target_x}, {local_target_y}) → 어떤 구역에도 속하지 않음')
+                navigator.info(
+                    f'좌표 ({local_target_x}, {local_target_y}) → '
+                    f'어떤 구역에도 속하지 않음'
+                )
             else:
                 target_zone_id                = zone["zone_id"]
                 target_zone_first_index       = zone["waypoint_indices"][0]
-                target_zone_first_patrol_pos  = waypoint_index_to_patrol_pos(target_zone_first_index)
-                target_zone_resume_patrol_pos = next_patrol_pos(target_zone_first_patrol_pos)
-                enforcement_x                 = local_target_x
-                enforcement_y                 = local_target_y
+                target_zone_resume_patrol_pos = next_patrol_pos(
+                    waypoint_index_to_patrol_pos(target_zone_first_index)
+                )
+                enforcement_x      = local_target_x
+                enforcement_y      = local_target_y
+                enforcement_source = local_source
                 current_mode = MODE_ROUTE_TO_ZONE
                 navigator.info(
-                    f'목표 ({local_target_x}, {local_target_y}) → '
+                    f'[{local_source}] 목표 ({local_target_x}, {local_target_y}) → '
                     f'구역 {target_zone_id}, '
                     f'첫 waypoint {target_zone_first_index+1} 으로 이동 시작'
                 )
             with node.state_lock:
                 node.goto_requested = False
 
-        # ── stop 조건: waypoint 1 지난 후 도킹 ───────
+        # ── stop 조건: waypoint 0 도착 후 도킹 ──────
         if local_stop and patrol_pos == 0:
-            navigator.info('마지막 waypoint 1 완료 → Pre-dock 이동 후 도킹')
+            navigator.info('마지막 waypoint 9 완료 → Pre-dock 이동 후 도킹')
             break
 
-        # ── 현재 웨이포인트 이동 ─────────────────────
+        # ── 현재 waypoint 이동 ───────────────────────
         current_waypoint_index = patrol_pos_to_waypoint_index(patrol_pos)
 
         if current_mode == MODE_ROUTE_TO_ZONE:
             log = f'구역 {target_zone_id}로 이동 중'
         elif local_stop:
-            log = '종료 전 이동'
+            log = '도킹 복귀 중'
         else:
             log = '순찰'
 
@@ -327,7 +540,6 @@ def patrol_cycle(node: AMR2Node, is_first_cycle: bool = False):
         arrived_waypoint_index = current_waypoint_index
         patrol_pos = next_patrol_pos(patrol_pos)
 
-        # ── 목표 구역 첫 waypoint 도착 → 단속 모드 ───
         if (
             current_mode == MODE_ROUTE_TO_ZONE
             and arrived_waypoint_index == target_zone_first_index
@@ -335,15 +547,15 @@ def patrol_cycle(node: AMR2Node, is_first_cycle: bool = False):
             current_mode = MODE_ENFORCEMENT
             patrol_pos   = target_zone_resume_patrol_pos
             navigator.info(f'구역 {target_zone_id} 첫 waypoint 도착 → 단속 실행')
-    
-    # ── Pre-dock 이동 후 도킹 ─────────────────────────
+
     move_to_pre_dock_and_dock(navigator)
     navigator.info('도킹 완료 → 다음 출발 신호 대기')
+
 
 def main():
     rclpy.init()
 
-    node = AMR2Node(robot_ns='robot3')
+    node = AMRNode(robot_ns='robot3')
 
     executor = MultiThreadedExecutor()
     executor.add_node(node)
@@ -362,6 +574,7 @@ def main():
         node.navigator.cancelTask()
     finally:
         rclpy.shutdown()
+
 
 if __name__ == '__main__':
     main()
