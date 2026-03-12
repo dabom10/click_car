@@ -180,9 +180,15 @@ class ParkingDetectionNode(Node):
         '''
         한국어('ko')와 영어('en')를 지원하는 EasyOCR 모델을 로드한다.
         한국 번호판은 숫자+한글 조합이므로 두 언어 모두 필요하다.
+
+        allowlist: 번호판에 등장할 수 있는 문자만 인식 대상으로 제한한다.
+          - 숫자 0~9
+          - 한글 지역명·용도 문자 (가~힣 전체보다 좁게 제한하면 더 정확하지만,
+            모형 번호판 종류가 다양할 수 있으므로 한글 전체 허용)
+        readtext 호출 시마다 파라미터를 넘기는 방식으로 사용한다.
         '''
         try:
-            self.ocr_reader = easyocr.Reader(['ko', 'en'])   # 한국어·영어 동시 지원
+            self.ocr_reader = easyocr.Reader(['ko', 'en'], gpu=False)   # 한국어·영어 동시 지원
             self.get_logger().info("EasyOCR initialized.")
         except Exception as e:
             self.get_logger().error(f"EasyOCR init failed: {e}")
@@ -491,6 +497,51 @@ class ParkingDetectionNode(Node):
 
         return img_crop   # 4꼭짓점을 찾지 못한 경우 원본 크롭 반환 (Fallback)
 
+    # ── 번호판 OCR 전처리 ────────────────────────
+
+    @staticmethod
+    def _preprocess_plate(img_crop: np.ndarray) -> np.ndarray:
+        '''
+        EasyOCR 인식률을 높이기 위해 번호판 크롭 이미지에 전처리를 적용한다.
+
+        처리 순서:
+          1. 3배 업스케일 (INTER_CUBIC): 작은 번호판 이미지의 글자 경계를 선명하게 확대
+             - 원본이 약 100x30 픽셀 수준이므로 업스케일 없이는 OCR 정보량이 부족
+          2. 그레이스케일 변환
+          3. CLAHE (Contrast Limited Adaptive Histogram Equalization):
+             - 조명이 고르지 않을 때 국소 대비를 강화해 글자와 배경 구분을 개선
+          4. Otsu 이진화:
+             - CLAHE 후 자동 임계값으로 글자(검정)와 배경(흰색)을 명확히 분리
+             - 모형 번호판(흰 바탕 검정 글자)에 적합
+          5. 테두리 크롭 (상하 10%, 좌우 5%):
+             - 번호판 프레임(빨간 테두리)이 OCR을 방해하므로 제거
+        '''
+        h, w = img_crop.shape[:2]
+        if h == 0 or w == 0:   # 크롭 실패 방어
+            return img_crop
+
+        # 1. 3배 업스케일: 작은 이미지에서 글자 픽셀 수를 충분히 확보
+        scale = 3
+        up = cv2.resize(img_crop, (w * scale, h * scale), interpolation=cv2.INTER_CUBIC)
+
+        # 2. 그레이스케일 변환 (이진화 전처리)
+        gray = cv2.cvtColor(up, cv2.COLOR_BGR2GRAY)
+
+        # 3. CLAHE: 타일(8x8) 단위로 대비 제한(clipLimit=2.0) 히스토그램 평활화
+        clahe   = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        enhanced = clahe.apply(gray)
+
+        # 4. Otsu 이진화: 히스토그램의 두 피크 사이 최적 임계값 자동 결정
+        _, binary = cv2.threshold(enhanced, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+        # 5. 테두리 크롭: 번호판 외곽 프레임 제거 (상하 10%, 좌우 5%)
+        bh, bw  = binary.shape
+        mh      = max(1, int(bh * 0.10))   # 상하 마진 (최소 1픽셀)
+        mw      = max(1, int(bw * 0.05))   # 좌우 마진 (최소 1픽셀)
+        cropped = binary[mh:bh - mh, mw:bw - mw]
+
+        return cropped
+
     # ── Firebase 업로드 및 OCR 워커 ─────────────
 
     def _upload_worker(self):
@@ -538,11 +589,28 @@ class ParkingDetectionNode(Node):
         now_dt     = datetime.datetime.now()
         now_iso    = now_dt.isoformat()   # "2025-03-11T14:23:05.123456"
 
-        # ── OCR: 번호판 크롭 → unwarp → EasyOCR ──
+        # ── OCR: 번호판 크롭 → unwarp → 전처리 → EasyOCR ──
         plate_number = "UNKNOWN"   # 인식 실패 기본값
         if self.ocr_reader is not None and plate_crop is not None:
-            unwarped   = self._unwarp_plate(plate_crop)               # 비스듬한 번호판 평탄화
-            ocr_result = self.ocr_reader.readtext(unwarped, detail=0) # 텍스트만 추출 (detail=0)
+            # 비스듬한 번호판 평탄화 (이미 반듯하면 내부에서 원본 반환)
+            unwarped = self._unwarp_plate(plate_crop)
+
+            # 업스케일 + CLAHE + Otsu 이진화 + 테두리 제거
+            preprocessed = self._preprocess_plate(unwarped)
+
+            # EasyOCR 호출 파라미터:
+            #   detail=0       : 좌표 없이 텍스트 문자열만 반환
+            #   paragraph=False: 줄 단위로 합치지 않고 개별 텍스트 박스 유지
+            #   width_ths=0.9  : 가로로 인접한 박스를 하나로 합치는 거리 임계값
+            #                    (번호판처럼 좁은 간격의 숫자/한글이 분리되는 현상 방지)
+            #   allowlist      : 숫자와 한글만 인식 대상으로 제한해 오인식 문자 차단
+            ocr_result = self.ocr_reader.readtext(
+                preprocessed,
+                detail=0,
+                paragraph=False,
+                width_ths=0.9,
+                allowlist="0123456789가나다라마바사아자차카타파하거너더러머버서어저처커터퍼허고노도로모보소오조초코토포호구누두루무부수우주추쿠투푸후기니디리미비시이지치키티피히",
+            )
             if ocr_result:
                 plate_number = "".join(ocr_result).replace(" ", "")   # 공백 제거 후 합치기
 
