@@ -43,7 +43,7 @@ from sensor_msgs.msg import CompressedImage    # 수신할 ROS2 메시지 타입
 from ultralytics import YOLO                   # YOLOv8 추론 엔진
 import firebase_admin                          # Firebase Admin SDK
 from firebase_admin import credentials, db     # 인증 및 Realtime DB 접근
-import easyocr                                 # 한국어 번호판 OCR 엔진
+from paddleocr import PaddleOCR               # 한국어 번호판 OCR 엔진 (PaddleOCR)
 
 
 # ──────────────────────────────────────────────
@@ -129,11 +129,11 @@ class ParkingDetectionNode(Node):
         self.current_case_ref = None   # 현재 단속 케이스의 DB 경로 참조
                                        # initial 이벤트 시 타임스탬프 키로 새로 생성되며,
                                        # confirmed 이벤트는 같은 참조에 update() 하여 로그를 이어쓴다.
-        self.ocr_reader       = None                                         # EasyOCR 모델 (초기화 후 설정)
+        self.ocr_reader       = None                                         # PaddleOCR 인스턴스 (초기화 후 설정)
 
         self._load_model()       # YOLO 모델 로드 및 워밍업
         self._init_firebase()    # Firebase 연결 및 DB 참조 생성
-        self._init_ocr()         # EasyOCR 초기화
+        self._init_ocr()         # PaddleOCR 초기화
         self._init_subscriber()  # ROS2 카메라 토픽 구독 등록
 
         # 업로드·OCR 전담 데몬 스레드 시작 (메인 루프 블로킹 방지)
@@ -178,20 +178,30 @@ class ParkingDetectionNode(Node):
 
     def _init_ocr(self):
         '''
-        한국어('ko')와 영어('en')를 지원하는 EasyOCR 모델을 로드한다.
-        한국 번호판은 숫자+한글 조합이므로 두 언어 모두 필요하다.
+        PaddleOCR 인스턴스를 초기화한다.
 
-        allowlist: 번호판에 등장할 수 있는 문자만 인식 대상으로 제한한다.
-          - 숫자 0~9
-          - 한글 지역명·용도 문자 (가~힣 전체보다 좁게 제한하면 더 정확하지만,
-            모형 번호판 종류가 다양할 수 있으므로 한글 전체 허용)
-        readtext 호출 시마다 파라미터를 넘기는 방식으로 사용한다.
+        EasyOCR 대비 PaddleOCR을 선택한 이유:
+          - EasyOCR의 CRAFT 검출기는 한글 자모를 개별 획으로 분리하는 경향이 있어
+            번호판처럼 짧고 밀집된 텍스트에서 인식률이 낮다.
+          - PaddleOCR의 DB(Differentiable Binarization) 검출기는 작고 밀집된
+            텍스트 영역 검출에 강하며, 한국어 인식 정확도가 더 높다.
+
+        주요 파라미터:
+          lang="korean"   : 한국어 + 영어·숫자 혼합 인식 (번호판 형식에 적합)
+          use_angle_cls=True : 90°·180° 회전된 텍스트도 바로잡아 인식
+          use_gpu=False   : CPU 전용 (AMR 환경에서 GPU 미보장)
+          show_log=False  : 매 호출마다 출력되는 PaddleOCR 내부 로그 억제
         '''
         try:
-            self.ocr_reader = easyocr.Reader(['ko', 'en'], gpu=False)   # 한국어·영어 동시 지원
-            self.get_logger().info("EasyOCR initialized.")
+            self.ocr_reader = PaddleOCR(
+                lang="korean",        # 한국어+숫자 혼합 인식 모드
+                use_angle_cls=True,   # 기울어진 텍스트 자동 각도 보정
+                use_gpu=False,        # CPU 전용 실행
+                show_log=False,       # 매 프레임 내부 로그 억제
+            )
+            self.get_logger().info("PaddleOCR initialized.")
         except Exception as e:
-            self.get_logger().error(f"EasyOCR init failed: {e}")
+            self.get_logger().error(f"PaddleOCR init failed: {e}")
 
     def _init_subscriber(self):
         '''
@@ -502,7 +512,7 @@ class ParkingDetectionNode(Node):
     @staticmethod
     def _preprocess_plate(img_crop: np.ndarray) -> np.ndarray:
         '''
-        EasyOCR 인식률을 높이기 위해 번호판 크롭 이미지에 전처리를 적용한다.
+        PaddleOCR 인식률을 높이기 위해 번호판 크롭 이미지에 전처리를 적용한다.
 
         처리 순서:
           1. 3배 업스케일 (INTER_CUBIC): 작은 번호판 이미지의 글자 경계를 선명하게 확대
@@ -589,30 +599,30 @@ class ParkingDetectionNode(Node):
         now_dt     = datetime.datetime.now()
         now_iso    = now_dt.isoformat()   # "2025-03-11T14:23:05.123456"
 
-        # ── OCR: 번호판 크롭 → unwarp → 전처리 → EasyOCR ──
+        # ── OCR: 번호판 크롭 → unwarp → 전처리 → PaddleOCR ──
         plate_number = "UNKNOWN"   # 인식 실패 기본값
         if self.ocr_reader is not None and plate_crop is not None:
             # 비스듬한 번호판 평탄화 (이미 반듯하면 내부에서 원본 반환)
             unwarped = self._unwarp_plate(plate_crop)
 
             # 업스케일 + CLAHE + Otsu 이진화 + 테두리 제거
+            # PaddleOCR도 전처리된 고해상도 이진화 이미지에서 더 높은 정확도를 보임
             preprocessed = self._preprocess_plate(unwarped)
 
-            # EasyOCR 호출 파라미터:
-            #   detail=0       : 좌표 없이 텍스트 문자열만 반환
-            #   paragraph=False: 줄 단위로 합치지 않고 개별 텍스트 박스 유지
-            #   width_ths=0.9  : 가로로 인접한 박스를 하나로 합치는 거리 임계값
-            #                    (번호판처럼 좁은 간격의 숫자/한글이 분리되는 현상 방지)
-            #   allowlist      : 숫자와 한글만 인식 대상으로 제한해 오인식 문자 차단
-            ocr_result = self.ocr_reader.readtext(
-                preprocessed,
-                detail=0,
-                paragraph=False,
-                width_ths=0.9,
-                allowlist="0123456789가나다라마바사아자차카타파하거너더러머버서어저처커터퍼허고노도로모보소오조초코토포호구누두루무부수우주추쿠투푸후기니디리미비시이지치키티피히",
-            )
-            if ocr_result:
-                plate_number = "".join(ocr_result).replace(" ", "")   # 공백 제거 후 합치기
+            # PaddleOCR 호출:
+            #   cls=True : use_angle_cls 초기화 설정과 연동하여 각도 보정 실행
+            #   반환값 구조: [[ [bbox, (text, confidence)], ... ], ...]
+            #   가장 바깥 리스트가 이미지 배치, 그 안이 검출된 텍스트 박스 목록
+            result = self.ocr_reader.ocr(preprocessed, cls=True)
+
+            if result and result[0]:   # 결과가 존재하고 첫 번째 이미지에 텍스트가 있을 때
+                texts = [
+                    line[1][0]                    # line[1] = (text, confidence), [0] = text
+                    for line in result[0]
+                    if line[1][1] >= 0.6          # 신뢰도 0.6 미만은 오인식으로 간주하고 제외
+                ]
+                if texts:
+                    plate_number = "".join(texts).replace(" ", "")   # 공백 제거 후 합치기
 
         if event == "initial":
             # 현재 시각을 키로 새 경로 생성: 이전 케이스와 겹치지 않고 누적된다
