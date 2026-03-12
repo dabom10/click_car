@@ -75,9 +75,10 @@ class ParkingDetectionNode(Node):
         self.tracked_vehicles   = []
         self.save_queue         = queue.Queue(maxsize=SAVE_QUEUE_MAXSIZE)
         self.db_ref             = None
-        self.latest_depth_frame = None          # depth_callback 갱신 (uint16, mm)
-        self.camera_info        = None          # info_callback 1회 저장
-        self._depth_lock        = threading.Lock()
+        self.latest_depth_frame    = None          # depth_callback 갱신 (uint16, mm)
+        self.camera_info           = None          # info_callback 1회 저장
+        self._depth_lock           = threading.Lock()
+        self._depth_no_data_warned = False         # NO_DATA 경고 1회만 출력
 
         self._load_model()
         self._init_firebase()
@@ -226,7 +227,10 @@ class ParkingDetectionNode(Node):
         lbl = det["class_name"]
 
         if depth_frame is None:
-            self.get_logger().info(f"[DEPTH] {lbl} pixel=({cx},{cy}) NO_DATA"); return
+            if not self._depth_no_data_warned:
+                self.get_logger().warn("[DEPTH] depth frame not yet received. NO_DATA logs suppressed.")
+                self._depth_no_data_warned = True
+            return
 
         h, w = depth_frame.shape[:2]
         if not (0 <= cy < h and 0 <= cx < w):
