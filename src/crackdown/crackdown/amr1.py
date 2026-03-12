@@ -91,6 +91,7 @@ TASK_POLL_PERIOD_SEC = 0.1
 MODE_PATROL        = "PATROL"
 MODE_ROUTE_TO_ZONE = "ROUTE_TO_ZONE"
 MODE_WAIT_RESUME   = "WAIT_RESUME"
+MODE_ENFORCEMENT   = "ENFORCEMENT"
 
 # ================================
 # 유틸 함수
@@ -225,13 +226,14 @@ class AMR2Node(Node):
 # ================================
 # 순찰 한 사이클
 # ================================
-def patrol_cycle(node: AMR2Node):
+def patrol_cycle(node: AMR2Node, is_first_cycle: bool = False):
     navigator = node.navigator
 
     # ── 출발 신호 대기 ────────────────────────────────
     navigator.info('[robot3] 출발 신호 대기 중...')
     with node.state_lock:
         node.start_patrol = False  # 이전 신호 초기화
+        node.stop_requested = False
 
     while rclpy.ok():
         with node.state_lock:
@@ -239,16 +241,15 @@ def patrol_cycle(node: AMR2Node):
                 break
         time.sleep(0.1)
 
-    # ── 초기 설정 ─────────────────────────────────────
-    if not navigator.getDockedStatus():
-        navigator.info('도킹 상태 아님 → 도킹 후 초기 포즈 설정')
-        navigator.dock()
-
-    actual_yaw = get_current_yaw('robot3')
-    navigator.info(f'측정된 yaw: {actual_yaw:.3f} rad')
-    initial_pose = navigator.getPoseStamped(INITIAL_POSITION, actual_yaw)
-    navigator.setInitialPose(initial_pose)
-    navigator.waitUntilNav2Active()
+    # ── 초기 설정 (첫 사이클만 실행) ─────────────────
+    if is_first_cycle:
+        if not navigator.getDockedStatus():
+            navigator.info('도킹 상태 아님 → 도킹 후 초기 포즈 설정')
+            navigator.dock()
+        actual_yaw   = get_current_yaw('robot3')
+        initial_pose = navigator.getPoseStamped(INITIAL_POSITION, actual_yaw)
+        navigator.setInitialPose(initial_pose)
+        navigator.waitUntilNav2Active()
     navigator.undock()
     navigator.info('순찰 시작!')
 
@@ -270,29 +271,18 @@ def patrol_cycle(node: AMR2Node):
             local_target_x = node.target_x
             local_target_y = node.target_y
 
-        # ── WAIT_RESUME 상태 ─────────────────────────
-        if current_mode == MODE_WAIT_RESUME:
-            if local_stop:
-                # waypoint 1까지 순찰 후 도킹
-                current_mode = MODE_PATROL
-                if target_zone_resume_patrol_pos is not None:
-                    patrol_pos = target_zone_resume_patrol_pos
-                navigator.info(
-                    f'WAIT_RESUME 중 stop → '
-                    f'waypoint {patrol_pos_to_waypoint_index(patrol_pos)+1} 부터 '
-                    f'waypoint 1까지 완료 후 도킹'
-                )
-                continue
-
-            # ── 목표 좌표로 이동 + 단속 ──────────────
+        # ── 단속 모드: 단속 실행 후 waypoint 1까지 복귀
+        if current_mode == MODE_ENFORCEMENT:
             do_enforcement(navigator, enforcement_x, enforcement_y, wait_sec=ENFORCEMENT_WAIT)
 
-            # ── 단속 완료 → 순찰 재개 ────────────────
+            # 단속 완료 → stop 플래그 ON → waypoint 1까지 이동 후 도킹
+            with node.state_lock:
+                node.stop_requested = True
             current_mode = MODE_PATROL
-            if target_zone_resume_patrol_pos is not None:
-                patrol_pos = target_zone_resume_patrol_pos
             navigator.info(
-                f'단속 완료 → waypoint {patrol_pos_to_waypoint_index(patrol_pos)+1} 부터 순찰 재개'
+                f'단속 완료 → '
+                f'waypoint {patrol_pos_to_waypoint_index(patrol_pos)+1} 부터 '
+                f'waypoint 1까지 이동 후 도킹'
             )
             continue
 
@@ -337,18 +327,15 @@ def patrol_cycle(node: AMR2Node):
         arrived_waypoint_index = current_waypoint_index
         patrol_pos = next_patrol_pos(patrol_pos)
 
-        # ── 목표 구역 첫 waypoint 도착 처리 ──────────
+        # ── 목표 구역 첫 waypoint 도착 → 단속 모드 ───
         if (
             current_mode == MODE_ROUTE_TO_ZONE
             and arrived_waypoint_index == target_zone_first_index
         ):
-            if local_stop:
-                current_mode = MODE_PATROL
-                navigator.info(f'구역 {target_zone_id} 도착 but stop 요청 → 계속 진행')
-            else:
-                current_mode = MODE_WAIT_RESUME
-                navigator.info(f'구역 {target_zone_id} 첫 waypoint 도착 → 단속 시작')
-
+            current_mode = MODE_ENFORCEMENT
+            patrol_pos   = target_zone_resume_patrol_pos
+            navigator.info(f'구역 {target_zone_id} 첫 waypoint 도착 → 단속 실행')
+    
     # ── Pre-dock 이동 후 도킹 ─────────────────────────
     move_to_pre_dock_and_dock(navigator)
     navigator.info('도킹 완료 → 다음 출발 신호 대기')
@@ -363,10 +350,12 @@ def main():
 
     executor_thread = threading.Thread(target=executor.spin, daemon=True)
     executor_thread.start()
+
     try:
-        # ── 무한 사이클: 도킹 후 다음 start 신호 대기 ──
+        is_first_cycle = True
         while rclpy.ok():
-            patrol_cycle(node)
+            patrol_cycle(node, is_first_cycle)
+            is_first_cycle = False
 
     except KeyboardInterrupt:
         node.navigator.info('Ctrl+C → 순찰 중단')
