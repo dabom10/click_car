@@ -2,7 +2,7 @@
 """
 amr1.py
 -------
-robot3 기준 테스트 - 출발 신호 수신 후 순찰 시작
+robot2 기준 테스트 - 출발 신호 수신 후 순찰 시작
 구역 기반 이동 + 단속 + waypoint 9까지 복귀 + 도킹 + 재시작 대기
 
 [전체 동작 흐름]
@@ -21,12 +21,12 @@ robot3 기준 테스트 - 출발 신호 수신 후 순찰 시작
                                                                 └─ 단속 완료 ──→ MODE_PATROL (stop ON)
 
 실행:
-  ros2 run crackdown amr2 --ros-args -r __ns:=/robot3
+  ros2 run crackdown amr2 --ros-args -r __ns:=/robot2
 
 토픽 송신:
-  출발: ros2 topic pub /robot3/patrol_command std_msgs/String "{data: 'start'}" --once
-  이동: ros2 topic pub /robot3/goto_target std_msgs/String "{data: '0.5,-4.7'}" --once
-  정지: ros2 topic pub /robot3/patrol_command std_msgs/String "{data: 'stop'}" --once
+  출발: ros2 topic pub /robot2/patrol_command std_msgs/String "{data: 'start'}" --once
+  이동: ros2 topic pub /robot2/goto_target std_msgs/String "{data: '0.5,-4.7'}" --once
+  정지: ros2 topic pub /robot2/patrol_command std_msgs/String "{data: 'stop'}" --once
 """
 
 import math
@@ -90,12 +90,12 @@ PATROL_ORDER  = [0, 1, 2, 3, 4, 5, 6, 7, 8]
 PATROL_LENGTH = len(PATROL_ORDER)
 FINAL_WAYPOINT_INDEX = 0
 
-# ── robot3 (AMR 1번) 기준 ──────────────────────────
+# ── robot2 (AMR 1번) 기준 ──────────────────────────
 # INITIAL_POSITION  = [0.0, 0.0]      # dock 1 기준
 INITIAL_POSITION  = [0.1424, 1.769]   # dock 2 기준
 
 # PRE_DOCK_POSITION = [-0.63, -0.20]   # dock 1
-PRE_DOCK_POSITION  = [-2.5, -1.7]      # dock 2
+PRE_DOCK_POSITION  = [-0.15, 1.83]      # dock 2
 PRE_DOCK_DIRECTION = TurtleBot4Directions.NORTH
 
 ENFORCEMENT_WAIT   = 10.0  # 단속 대기 시간 (초) - 파라미터로 조정 가능
@@ -261,7 +261,7 @@ class AMR2Node(Node):
       /{robot_ns}/patrol_command  → 'start' / 'stop'
       /{robot_ns}/goto_target     → 'x,y' 형식 좌표 문자열
     """
-    def __init__(self, robot_ns='robot3'):
+    def __init__(self, robot_ns='robot2'):
         super().__init__('amr1_node')
 
         self.robot_ns = robot_ns
@@ -309,7 +309,7 @@ class AMR2Node(Node):
 
         'start' 수신: start_patrol = True, stop_requested 초기화
         'stop'  수신: stop_requested = True
-                      → 메인 루프에서 waypoint 9 도착 후 도킹 처리
+                      → 메인 루프에서 waypoint 1 도착 후 도킹 처리
         """
         with self.state_lock:
             if msg.data == 'start':
@@ -317,7 +317,7 @@ class AMR2Node(Node):
                 self.get_logger().info('출발 신호 수신 → 순찰 시작!')
             elif msg.data == 'stop':
                 self.stop_requested = True
-                self.get_logger().info('정지 신호 수신 → waypoint 9까지 완료 후 도킹')
+                self.get_logger().info('정지 신호 수신 → waypoint 1까지 완료 후 도킹')
 
     def goto_target_callback(self, msg):
         """
@@ -384,7 +384,7 @@ def patrol_cycle(node: AMR2Node, is_first_cycle: bool = False):
     # ── 출발 신호 대기 ────────────────────────────────
     # 사이클 시작마다 이전 사이클의 플래그를 초기화해야
     # 잔류 stop 신호로 인해 바로 도킹되는 버그를 방지할 수 있다.
-    navigator.info('[robot3] 출발 신호 대기 중...')
+    navigator.info('[robot2] 출발 신호 대기 중...')
     with node.state_lock:
         node.start_patrol = False  # 이전 신호 초기화
         node.stop_requested = False
@@ -401,7 +401,7 @@ def patrol_cycle(node: AMR2Node, is_first_cycle: bool = False):
         if not navigator.getDockedStatus():
             navigator.info('도킹 상태 아님 → 도킹 후 초기 포즈 설정')
             navigator.dock()
-        actual_yaw   = get_current_yaw('robot3')
+        actual_yaw   = get_current_yaw('robot2')
         initial_pose = navigator.getPoseStamped(INITIAL_POSITION, actual_yaw)
         navigator.setInitialPose(initial_pose)
         navigator.waitUntilNav2Active()
@@ -450,7 +450,7 @@ def patrol_cycle(node: AMR2Node, is_first_cycle: bool = False):
             navigator.info(
                 f'단속 완료 → '
                 f'waypoint {patrol_pos_to_waypoint_index(patrol_pos)+1} 부터 '
-                f'waypoint 9까지 이동 후 도킹'
+                f'waypoint 1까지 이동 후 도킹'
             )
             continue
 
@@ -480,9 +480,9 @@ def patrol_cycle(node: AMR2Node, is_first_cycle: bool = False):
 
         # ── stop 조건 확인 ───────────────────────────
         # stop_requested == True 이고 patrol_pos == 0 이면
-        # waypoint 9을 막 완료한 시점이므로 루프 탈출 후 도킹
+        # waypoint 1을 막 완료한 시점이므로 루프 탈출 후 도킹
         if local_stop and patrol_pos == 0:
-            navigator.info('마지막 waypoint 9 완료 → Pre-dock 이동 후 도킹')
+            navigator.info('마지막 waypoint 1 완료 → Pre-dock 이동 후 도킹')
             break
 
         # ── 현재 웨이포인트 이동 ─────────────────────
@@ -532,7 +532,7 @@ def main():
     """
     rclpy.init()
 
-    node = AMR2Node(robot_ns='robot3')
+    node = AMR2Node(robot_ns='robot2')
 
     executor = MultiThreadedExecutor()
     executor.add_node(node)
