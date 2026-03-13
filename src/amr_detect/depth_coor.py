@@ -47,7 +47,7 @@ YOLO_IMG_SIZE    = 704
 TOPIC_RGB        = f"{ROBOT_NAMESPACE}/oakd/rgb/image_raw/compressed"
 TOPIC_DEPTH      = f"{ROBOT_NAMESPACE}/oakd/stereo/image_raw/compressedDepth"
 TOPIC_INFO       = f"{ROBOT_NAMESPACE}/oakd/rgb/camera_info"
-TOPIC_AMR_TARGET = f"{ROBOT_NAMESPACE}/amr_done"
+TOPIC_AMR_TARGET = f"{ROBOT_NAMESPACE}amr_done"
 
 WINDOW_NAME      = "Parking Detection"
 PUBLISH_INTERVAL = 0.2
@@ -67,18 +67,17 @@ DEPTH_PERCENTILE       = 10
 MAX_DEPTH_AGE_SEC = 0.15
 
 # ── EKF 파라미터 ──────────────────────────────
-# 프로세스 노이즈 Q: 로봇 가속도 불확실성 (m/s²)
-# 값이 클수록 필터가 측정값을 더 신뢰 (기동성 높은 물체면 올림)
-EKF_ACCEL_STD    = 0.05   # 0.05 m/s² → 거의 정지한 주차 차량에 적합
+# 프로세스 노이즈 Q: 정지 모델용 (매우 작게)
+# 값이 작을수록 "물체가 절대 안 움직인다"고 강하게 가정
+# 너무 작으면 초기 수렴이 느려지므로 1e-4 권장
+EKF_Q_STATIC     = 1e-4
 
 # 관측 노이즈 계수 (논문 기반, OAK-D Pro 실측 근사)
-# R은 매 측정마다 Z에 따라 동적으로 계산됨
 EKF_SIGMA_XY_K   = 0.003  # σ_xy = K_xy × Z  (횡방향)
 EKF_SIGMA_Z_K    = 0.005  # σ_z  = K_z  × Z² (깊이, 비선형)
 
 # Mahalanobis 이상치 게이팅 임계값
 # Chi-squared 분포 3-DOF, 95% 신뢰구간 = 7.815
-# (95% 이상의 확률로 같은 물체라면 통과, 아니면 이상치로 차단)
 EKF_GATE_CHI2    = 7.815
 
 # Publish 신뢰도: history 몇 프레임 이상 쌓인 뒤 발행할지
@@ -86,116 +85,80 @@ MIN_HISTORY_TO_PUBLISH = 3
 
 
 # ================================================================
-#  EKF3D — Extended Kalman Filter (3D, Constant Velocity Model)
+#  EKF3D — Static Object Position Filter
 #
-#  선형 KF와의 핵심 차이:
-#    선형 KF : R = 고정 상수 행렬
-#    EKF     : R = f(Z) — 측정할 때마다 Z(깊이)에 맞게 재계산
+#  [이전 버전과의 핵심 차이]
+#  이전: CV 모델 (Constant Velocity), 상태벡터 [px,py,pz,vx,vy,vz] 6-state
+#  현재: 정지 모델 (Static),          상태벡터 [px,py,pz]           3-state
 #
-#  상태벡터 x = [px, py, pz, vx, vy, vz]  (6×1)
-#  관측벡터 z = [px, py, pz]              (3×1)
+#  CV 모델이 정지 물체에 드리프트를 유발하는 이유:
+#    depth 노이즈(±3cm)가 매 프레임 조금씩 다른 방향으로 발생하면
+#    CV 모델은 이를 "실제 이동"으로 해석해 vz에 속도를 학습함.
+#    로봇·차 모두 정지 상태여도 vz ≠ 0이 되면
+#    predict()마다 pz += vz × dt 로 계속 밀려 드리프트 발생.
 #
-#  비선형 요소:
-#    관측 함수 h(x) = x[:3] 자체는 선형이지만
-#    관측 노이즈 R(Z)이 상태(Z=pz)에 의존 → EKF 범주
+#  정지 모델(F = I)은 "물체가 이전 위치 그대로" 라고만 예측.
+#    → 속도 성분 자체가 없으므로 드리프트 원천 차단.
+#    → 불법 주차 차량처럼 정지한 물체에 최적.
+#
+#  EKF 범주를 유지하는 이유:
+#    관측 노이즈 R(Z)이 깊이 Z에 비선형적으로 의존하기 때문.
+#    (선형 KF는 R을 고정 상수로만 쓸 수 있음)
 # ================================================================
 class EKF3D:
     def __init__(self, x0: float, y0: float, z0: float):
-        # ── 상태 전이 행렬 F (등속도, dt는 predict() 시점에 갱신) ──
-        self.F = np.eye(6, dtype=np.float64)
-        # F의 상단 오른쪽 3×3 블록 = dt * I — predict()에서 채움
+        # ── 상태벡터: 위치만 (3-state) ──
+        self.x = np.array([x0, y0, z0], dtype=np.float64)
 
-        # ── 관측 행렬 H (위치만 관측, 선형) ──
-        self.H = np.zeros((3, 6), dtype=np.float64)
-        self.H[0, 0] = self.H[1, 1] = self.H[2, 2] = 1.0
+        # ── 상태 전이 행렬 F = I (정지 모델: "다음도 지금과 같은 위치") ──
+        # CV 모델의 F에는 dt 블록이 있어 속도를 위치에 더했음.
+        # F = I 이면 predict()에서 x = F @ x = x → 위치 불변.
+        self.F = np.eye(3, dtype=np.float64)
 
-        # ── 프로세스 노이즈 Q (이산화된 등가속도 모델, Singer 근사) ──
-        # Q = diag([σ_a² · dt³/3, ..., σ_a² · dt, ...])
-        # 여기서는 초기값으로 dt=0.1 기준으로 미리 세팅,
-        # predict()에서 dt가 달라지면 재계산
-        self._accel_var = EKF_ACCEL_STD ** 2
-        self.Q = self._make_Q(dt=0.1)
+        # ── 관측 행렬 H = I (위치를 직접 관측) ──
+        self.H = np.eye(3, dtype=np.float64)
 
-        # ── 초기 상태 ──
-        self.x = np.array([x0, y0, z0, 0.0, 0.0, 0.0], dtype=np.float64)
+        # ── 프로세스 노이즈 Q ──
+        # 실제로 차가 안 움직이므로 Q는 매우 작게.
+        # Q가 작을수록 필터가 모델(정지)을 강하게 신뢰 → 안정적.
+        # Q가 너무 0이면 P가 수렴 후 새 측정값을 완전히 무시하므로
+        # 아주 작은 값(1e-4)을 유지해 적응성 보존.
+        self.Q = np.eye(3, dtype=np.float64) * EKF_Q_STATIC
 
-        # ── 초기 공분산 P ──
-        # 위치: 측정 노이즈 수준, 속도: 크게 잡아 빠른 수렴 유도
-        P_pos = self._make_R(z0)[0, 0]   # 첫 측정의 σ_xy² 정도
-        P_vel = 1.0                        # 속도 초기 불확실성 (크게)
-        self.P = np.diag([P_pos, P_pos, P_pos * 4,
-                          P_vel, P_vel, P_vel]).astype(np.float64)
+        # ── 초기 공분산 P: 첫 측정의 불확실성 수준으로 시작 ──
+        R0 = self._make_R(z0)
+        self.P = R0.copy()
 
     # ── 내부 헬퍼 ──────────────────────────────────────
-    def _make_Q(self, dt: float) -> np.ndarray:
-        """
-        Singer 이산화 프로세스 노이즈 행렬 (간략화)
-        Q = σ_a² * [[dt³/3·I, dt²/2·I],
-                     [dt²/2·I, dt·I   ]]
-        """
-        q  = self._accel_var
-        q3 = q * dt**3 / 3.0
-        q2 = q * dt**2 / 2.0
-        q1 = q * dt
-
-        Q = np.zeros((6, 6), dtype=np.float64)
-        for i in range(3):
-            Q[i,   i  ] = q3
-            Q[i,   i+3] = q2
-            Q[i+3, i  ] = q2
-            Q[i+3, i+3] = q1
-        return Q
-
     def _make_R(self, Z: float) -> np.ndarray:
         """
-        논문 기반 동적 관측 노이즈 행렬
+        논문 기반 동적 관측 노이즈 행렬 — 이전과 동일하게 유지
           σ_xy = K_xy × Z      (횡방향: 거리에 선형)
           σ_z  = K_z  × Z²     (깊이: 거리의 제곱, 비선형)
-
-        Z가 클수록 R이 커짐 → 필터가 측정값을 덜 신뢰하고
-        예측(모델)을 더 믿음 → 원거리에서 자동으로 스무딩 강화
         """
-        Z = max(Z, 0.1)   # 0 나누기 방지
+        Z = max(Z, 0.1)
         sig_xy = EKF_SIGMA_XY_K * Z
         sig_z  = EKF_SIGMA_Z_K  * Z * Z
         return np.diag([sig_xy**2, sig_xy**2, sig_z**2])
 
-    # ── predict / update ───────────────────────────────
-    def predict(self, dt: float) -> np.ndarray:
+    # ── predict ────────────────────────────────────────
+    def predict(self) -> np.ndarray:
         """
-        예측 단계
-          x̂ₖ₋ = F · x̂ₖ₋₁
-          Pₖ₋  = F · Pₖ₋₁ · Fᵀ + Q
+        예측 단계: x = F @ x = x (위치 그대로)
+        P만 Q만큼 조금 커짐 → 시간이 지날수록 불확실성 소폭 증가.
+        dt 인자 불필요 (정지 모델에서 dt는 의미 없음).
         """
-        dt = max(dt, 1e-4)
-
-        # F 갱신 (dt 반영)
-        self.F[0, 3] = self.F[1, 4] = self.F[2, 5] = dt
-
-        # Q 갱신 (dt 반영)
-        self.Q = self._make_Q(dt)
-
-        self.x = self.F @ self.x
+        # x는 변하지 않음 (F = I)
         self.P = self.F @ self.P @ self.F.T + self.Q
-        return self.x[:3].copy()
+        return self.x.copy()
 
     def update(self, z_meas: np.ndarray) -> np.ndarray:
         """
-        보정 단계 (EKF update with Mahalanobis gating)
-
-          혁신(innovation):  y = z - H·x̂
-          혁신 공분산:       S = H·P·Hᵀ + R(Z)
-          Mahalanobis 거리:  d² = yᵀ · S⁻¹ · y
-            → d² > χ²₀.₉₅(3) = 7.815 이면 이상치로 폐기
-          Kalman Gain:       K = P·Hᵀ·S⁻¹
-          상태 갱신:         x = x̂ + K·y
-          공분산 갱신(Joseph form):
-            P = (I - KH)·P·(I - KH)ᵀ + K·R·Kᵀ
-            ← 수치 오차 누적 시에도 P의 양반정치성(PSD) 보장
+        보정 단계 — Mahalanobis 게이팅 + Joseph form 유지
         """
         z = np.array(z_meas, dtype=np.float64)
 
-        # 현재 깊이 추정값(Z)으로 R 동적 계산
+        # 현재 깊이 Z로 R 동적 계산
         Z_est = max(self.x[2], 0.1)
         R = self._make_R(Z_est)
 
@@ -206,19 +169,14 @@ class EKF3D:
         S = self.H @ self.P @ self.H.T + R
 
         # ── Mahalanobis 이상치 게이팅 ──────────────────
-        # d² = yᵀ S⁻¹ y : 측정값이 예측 분포 안에 있는지 확인
-        # 물리적 의미: 예측 위치에서 측정값까지의 "통계적 거리"
-        # 단순 유클리드 거리와 달리 방향별 불확실성을 고려함
         try:
             S_inv = np.linalg.inv(S)
         except np.linalg.LinAlgError:
-            return self.x[:3].copy()   # S가 singular면 업데이트 건너뜀
+            return self.x.copy()
 
         d2 = float(y @ S_inv @ y)
-
         if d2 > EKF_GATE_CHI2:
-            # 95% 신뢰구간 밖 → 이상치로 판단, 예측 상태 유지
-            return self.x[:3].copy()
+            return self.x.copy()
 
         # ── Kalman Gain ─────────────────────────────────
         K = self.P @ self.H.T @ S_inv
@@ -227,20 +185,19 @@ class EKF3D:
         self.x = self.x + K @ y
 
         # ── 공분산 갱신 (Joseph form) ────────────────────
-        # 일반 형태: P = (I - KH)P
         # Joseph form: P = (I-KH)P(I-KH)ᵀ + KRKᵀ
         # → 수치 오차로 P가 비대칭/비PSD가 되는 현상 방지
-        I_KH = np.eye(6) - K @ self.H
+        I_KH = np.eye(3) - K @ self.H   # 3-state이므로 eye(3)
         self.P = I_KH @ self.P @ I_KH.T + K @ R @ K.T
 
-        return self.x[:3].copy()
+        return self.x.copy()
 
     def get_position(self) -> np.ndarray:
-        return self.x[:3].copy()
+        return self.x.copy()
 
     def get_covariance_xyz(self) -> np.ndarray:
         """위치 공분산 (3×3) 반환 — 수렴 상태 모니터링용"""
-        return self.P[:3, :3].copy()
+        return self.P.copy()   # 이미 3×3
 
 
 # ================================================================
@@ -262,7 +219,6 @@ class Track:
 
     def update(self, det: dict, xyz_uv=None):
         now = time.monotonic()
-        dt  = now - self.last_ekf_time
         self.det       = det
         self.last_seen = now
 
@@ -273,14 +229,12 @@ class Track:
             if self.ekf is None:
                 self.ekf = EKF3D(x_m, y_m, z_m)
             else:
-                self.ekf.predict(dt)
+                self.ekf.predict()                              # dt 불필요 (정지 모델)
                 self.ekf.update(np.array([x_m, y_m, z_m]))
         else:
-            # 측정값 없어도 예측은 수행 (트랙 연속성 유지)
+            # 측정값 없어도 predict는 수행 (P가 소폭 증가 → 다음 측정에 더 열린 자세)
             if self.ekf is not None:
-                self.ekf.predict(dt)
-
-        self.last_ekf_time = now
+                self.ekf.predict()
 
     def is_alive(self) -> bool:
         return (time.monotonic() - self.last_seen) <= TRACK_TTL_SEC
