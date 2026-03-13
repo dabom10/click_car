@@ -235,7 +235,7 @@ def do_enforcement(navigator, target_x, target_y, wait_sec=ENFORCEMENT_WAIT):
 
     while not navigator.isTaskComplete():
         time.sleep(TASK_POLL_PERIOD_SEC)
-
+    AMR2Node.set_status(STATUS_ENFORCE)
     navigator.info(f'[단속] 도착 완료 → {wait_sec}초 단속 대기')
     time.sleep(wait_sec)
     navigator.info('[단속] 단속 완료!')
@@ -429,7 +429,6 @@ def patrol_cycle(node: AMR2Node, is_first_cycle: bool = False):
 
         # ── 단속 모드 ────────────────────────────────
         if current_mode == MODE_ENFORCEMENT:
-            node.set_status(STATUS_ENFORCE)
             do_enforcement(
                 navigator,
                 enforcement_x,
@@ -465,8 +464,6 @@ def patrol_cycle(node: AMR2Node, is_first_cycle: bool = False):
                 enforcement_x = local_target_x
                 enforcement_y = local_target_y
                 current_mode = MODE_ROUTE_TO_ZONE
-
-                node.set_status(STATUS_ENFORCE)
                 navigator.info(
                     f'목표 ({local_target_x}, {local_target_y}) → '
                     f'구역 {target_zone_id}, '
