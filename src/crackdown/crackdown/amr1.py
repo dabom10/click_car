@@ -254,6 +254,9 @@ def do_enforcement(navigator, node, target_x, target_y, source):
     navigator.goToPose(goal_pose)
     while not navigator.isTaskComplete():
         time.sleep(TASK_POLL_PERIOD_SEC)
+
+    # AMRNode.set_status(STATUS_ENFORCE)
+    node.set_status(STATUS_ENFORCE)
     navigator.info(f'[단속/{source}] 도착 완료 → 촬영 시작 신호 pub')
 
     # capture_done 잔류값 초기화 후 촬영 시작 신호 pub
@@ -261,10 +264,10 @@ def do_enforcement(navigator, node, target_x, target_y, source):
         node.capture_done = False
 
     if source == SOURCE_CCTV:
-        node.cctv_start_pub.publish(Bool(data=True))
+        node.cap_start_pub.publish(String(data='cctv'))
         navigator.info('[단속/CCTV] cctv_start(True) pub → capture_done 대기')
     else:
-        node.amr_start_pub.publish(Bool(data=True))
+        node.cap_start_pub.publish(String(data='amr'))
         navigator.info('[단속/AMR] amr_start(True) pub → capture_done 대기')
 
     # capture_done True 수신까지 대기
@@ -354,8 +357,9 @@ class AMRNode(Node):
         )
 
         # ── 발행 ─────────────────────────────────────
-        self.cctv_start_pub = self.create_publisher(Bool, f'/{robot_ns}/cctv_start', 10)
-        self.amr_start_pub  = self.create_publisher(Bool, f'/{robot_ns}/amr_start',  10)
+        self.cap_start_pub = self.create_publisher(String, f'/{robot_ns}/cap_start', 10)        
+        # self.cctv_start_pub = self.create_publisher(Bool, f'/{robot_ns}/cctv_start', 10)
+        # self.amr_start_pub  = self.create_publisher(Bool, f'/{robot_ns}/amr_start',  10)
         # ── 상태 퍼블리셔 ──────────────────────────────
         self.status_pub = self.create_publisher(
             String,
@@ -562,7 +566,7 @@ def patrol_cycle(node: AMRNode, is_first_cycle: bool = False):
                 enforcement_source = local_source
                 current_mode = MODE_ROUTE_TO_ZONE
 
-                node.set_status(STATUS_ENFORCE)
+                # node.set_status(STATUS_ENFORCE)
                 navigator.info(
                     f'[{local_source}] 목표 ({local_target_x}, {local_target_y}) → '
                     f'구역 {target_zone_id}, '
@@ -581,7 +585,7 @@ def patrol_cycle(node: AMRNode, is_first_cycle: bool = False):
         current_waypoint_index = patrol_pos_to_waypoint_index(patrol_pos)
 
         if current_mode == MODE_ROUTE_TO_ZONE:
-            node.set_status(STATUS_ENFORCE)
+            # node.set_status(STATUS_ENFORCE)
             log = f'구역 {target_zone_id}로 이동 중'
         elif local_stop:
             node.set_status(STATUS_RETURNING)
