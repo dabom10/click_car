@@ -45,22 +45,23 @@ from rclpy.qos import (                        # 카메라 토픽 구독 품질 
     QoSProfile, ReliabilityPolicy, HistoryPolicy
 )
 from sensor_msgs.msg import CompressedImage            # 카메라 이미지 수신
-from std_msgs.msg import String                        # 모드 명령 수신 ("amr_start" / "cctv_start")
+from std_msgs.msg import String, Bool                  # 모드 명령 수신 ("amr_start" / "cctv_start")
 from irobot_create_msgs.msg import AudioNoteVector, AudioNote  # AMR 알림음 송신
 from builtin_interfaces.msg import Duration            # AudioNote 지속 시간 표현
 from ultralytics import YOLO                           # YOLOv8 추론 엔진
 import firebase_admin                                  # Firebase Admin SDK
 from firebase_admin import credentials, db             # 인증 및 Realtime DB 접근
-from paddleocr import PaddleOCR                        # 번호판 OCR 엔진
+from paddleocr import PaddleOCR                        # 번호판 OCR 엔진 (fallback)
+from google.cloud import vision                        # Google Cloud Vision OCR (1순위)
 
 
 # ──────────────────────────────────────────────
 # [CHAPTER 1: 하이퍼파라미터]
 # ──────────────────────────────────────────────
 
-ROBOT_NAMESPACE          = "/robot2"                                                               # ROS2 네임스페이스
+ROBOT_NAMESPACE          = "/robot2"                                                               # ROS2 기본 네임스페이스 (robot2 / robot3 동적 전환)
 MODEL_PATH               = "/home/rokey/click_car/models/amr.pt"                                  # YOLOv8 가중치 경로
-FIREBASE_CRED_PATH       = "/home/rokey/click_car/web/click_car.json"                             # Firebase 서비스 계정 키 경로
+FIREBASE_CRED_PATH       = "/home/rokey/Downloads/iligalstop-firebase-adminsdk-fbsvc-d989ef0f8c.json"                             # Firebase 서비스 계정 키 경로
 FIREBASE_DB_URL          = "https://iligalstop-default-rtdb.asia-southeast1.firebasedatabase.app" # Realtime DB URL
 FIREBASE_DB_PATH         = "detections"          # 단속 로그를 저장할 DB 상위 경로 (하위에 케이스별 노드가 누적됨)
 
@@ -72,50 +73,69 @@ PARKING_TIMEOUT_AMR      = 30.0    # amr_start  모드: 30초 (AMR 직접 출동
 PARKING_TIMEOUT_CCTV     =  5.0    # cctv_start 모드:  5초 (CCTV 연동 빠른 확인)
 SAVE_QUEUE_MAXSIZE       = 50      # 업로드 큐 최대 항목 수: 초과 시 신규 항목 드랍
 
-# ROS2 토픽 경로
-TOPIC_RGB   = f"{ROBOT_NAMESPACE}/oakd/rgb/image_raw/compressed"  # 카메라 이미지 구독
-TOPIC_CMD   = f"{ROBOT_NAMESPACE}/parking_cmd"                    # 모드 명령 수신
-TOPIC_AUDIO = f"{ROBOT_NAMESPACE}/cmd_audio"                      # AMR 알림음 퍼블리시
+# ── 멀티 로봇 지원 ────────────────────────────────────────────────────────────
+# robot2 / robot3 두 대를 하나의 노드 인스턴스로 처리한다.
+# /robot2/start 또는 /robot3/start 를 수신하면 해당 네임스페이스를 self.ns 에 저장하고,
+# 이후 카메라 구독·오디오 퍼블리시·capture_done 퍼블리시를 모두 그 네임스페이스로 전환한다.
+SUPPORTED_NAMESPACES = ["/robot2", "/robot3"]
+
+# CMD 토픽은 두 로봇 모두 구독 (카메라/오디오/done 은 명령 수신 후 동적 생성)
+TOPIC_CMD_ROBOT2  = "/robot2/start"
+TOPIC_CMD_ROBOT3  = "/robot3/start"
+
+# CCTV 연동 전용 Firebase 경로
+FIREBASE_CCTV_DB_PATH = "cctv_detections"   # webcam_detector 가 생성한 케이스에 AMR 증거를 추가하는 경로
+
+GOOGLE_VISION_CRED_PATH = "/home/rokey/Downloads/google_vision.json"  # GCV 서비스 계정 키 경로
 
 
 # ──────────────────────────────────────────────
 # [CHAPTER 2: Santa Claus is Coming to Town 멜로디]
 # ──────────────────────────────────────────────
 # 각 튜플: (주파수 Hz, 지속 시간 ms)
-# BPM ≈ 120 → 4분음표 = 500ms, 8분음표 = 250ms
-# 음계: C4=262, D4=294, E4=330, F4=349, F#4=370, G4=392, A4=440, B4=494, C5=523
-# 총 재생 시간 ≈ 35초 → amr_start 모드의 30초 타이머 전체를 커버한다.
+# BPM ≈ 120 → 4분음표 = 500ms, 8분음표 = 250ms, 점4분음표 = 750ms
+#
+# 실제 악보 기준 음계 (C장조):
+#   C4=262, D4=294, E4=330, F4=349, G4=392, A4=440, B4=494
+#   C5=523, D5=587, E5=659, G5=784
+#
+# ※ 원본 코드의 오류:
+#   - F#4(370) 는 C장조에 없는 음 → F4(349) 로 교정
+#   - "You better not cry" 의 멜로디가 "watch out" 과 동일한데
+#     원본은 다른 음(A4 기반)으로 잘못 기입됨 → 동일 패턴으로 교정
+#   - "He knows if..." 구절의 음 순서 교정
 
 SANTA_NOTES = [
-    # ── "You better watch out" ──
+    # ── "You better watch out" (G G G E G)
     (392, 250), (392, 250), (392, 500), (330, 500), (392, 1000),
-    # ── "You better not cry" ──
-    (440, 250), (440, 250), (440, 500), (370, 500), (440, 1000),
-    # ── "Better not pout" ──
+    # ── "You better not cry" (G G G E G)  ← watch out 과 동일 멜로디
+    (392, 250), (392, 250), (392, 500), (330, 500), (392, 1000),
+    # ── "Better not pout" (G G G E G·)
     (392, 250), (392, 250), (392, 500), (330, 500), (392,  500),
-    # ── "I'm telling you why" ──
+    # ── "I'm telling you why" (C5 C5 B4 A4 G)
     (523, 500), (523, 500), (494, 500), (440, 500), (392, 1000),
-    # ── "Santa Claus is coming to town" ──
-    (330, 250), (330, 250), (349, 250), (392, 250),
+    # ── "Santa Claus is" (E E F G)
+    (330, 250), (330, 250), (349, 250), (392, 500),
+    # ── "coming to town" (G F E D C)
     (392, 250), (349, 250), (330, 250), (294, 250), (262, 1000),
-    # ── "He sees you when you're sleeping" ──
+    # ── "He sees you when you're sleeping" (G G G G A G E C)
     (392, 250), (392, 250), (392, 250), (392, 250),
     (440, 250), (392, 250), (330, 250), (262,  750),
-    # ── "He knows when you're awake" ──
-    (330, 250), (330, 250), (349, 250), (392, 250), (440, 1000),
-    # ── "He knows if you've been bad or good" ──
+    # ── "He knows when you're awake" (E E E E F·)
+    (330, 250), (330, 250), (330, 250), (330, 250), (349, 1000),
+    # ── "He knows if you've been bad or good" (G G A G E C)
     (392, 250), (392, 250), (440, 250), (392, 250), (330, 250), (262, 750),
-    # ── "So be good for goodness sake!" ──
+    # ── "So be good for goodness sake!" (D D E D G)
     (294, 250), (294, 250), (330, 250), (294, 500), (392, 1000),
-    # ── "Oh! You better watch out" ──
+    # ── "Oh! You better watch out" (G G G E G)
     (392, 250), (392, 250), (392, 500), (330, 500), (392, 1000),
-    # ── "You better not cry" ──
-    (440, 250), (440, 250), (440, 500), (370, 500), (440, 1000),
-    # ── "Better not pout, I'm telling you why" ──
+    # ── "You better not cry" (G G G E G)
+    (392, 250), (392, 250), (392, 500), (330, 500), (392, 1000),
+    # ── "Better not pout, I'm telling you why" 
     (392, 250), (392, 250), (392, 500), (330, 500), (392,  500),
     (523, 500), (523, 500), (494, 500), (440, 500), (392, 1000),
-    # ── "Santa Claus is coming to town" (마지막, 롱 엔딩) ──
-    (330, 250), (330, 250), (349, 250), (392, 250),
+    # ── "Santa Claus is coming to town" (마지막, 롱 엔딩)
+    (330, 250), (330, 250), (349, 250), (392, 500),
     (392, 250), (349, 250), (330, 250), (294, 250), (262, 1500),
 ]
 
@@ -181,30 +201,38 @@ class ParkingDetectionNode(Node):
         super().__init__("parking_detection_node")
 
         # ── 상태 변수 ──
+        self.ns                = None   # 현재 통신 중인 로봇 네임스페이스 ("/robot2" | "/robot3")
         self.tracked_vehicles  = []                                      # 현재 추적 중인 차량 목록
         self.save_queue        = queue.Queue(maxsize=SAVE_QUEUE_MAXSIZE) # 업로드 작업 큐
         self.db_ref            = None   # Firebase Admin DB 모듈 참조 (초기화 후 설정)
         self.current_case_ref  = None   # 현재 단속 케이스 DB 경로 참조
-                                        # initial 이벤트 시 타임스탬프 키로 새로 생성되며,
-                                        # confirmed 이벤트는 같은 참조에 update() 하여 로그를 이어쓴다.
+        self.cctv_case_key     = None   # cctv_start 모드: webcam_detector 가 생성한 케이스 키
         self.ocr_reader        = None   # PaddleOCR 인스턴스 (초기화 후 설정)
+        self.gcv_client        = None   # Google Cloud Vision 클라이언트 (1순위 OCR)
         self.mode              = None   # 현재 동작 모드: "amr_start" | "cctv_start" | None(대기)
         self.parking_timeout   = None   # 현재 모드의 단속 타이머 값(초)
         self._audio_stop_event = threading.Event()  # 알림음 스레드 종료 신호용 이벤트
 
+        # ── 동적 퍼블리셔·구독자 (네임스페이스 확정 후 생성) ──
+        self.audio_pub        = None   # /robotN/cmd_audio        — cmd_callback 에서 생성
+        self.capture_done_pub = None   # /robotN/capture_done     — cmd_callback 에서 생성
+        self._cam_sub         = None   # /robotN/oakd/.../compressed — cmd_callback 에서 생성
+
         # ── 초기화 ──
         self._load_model()        # YOLO 모델 로드 및 워밍업
         self._init_firebase()     # Firebase 연결 및 DB 참조 생성
-        self._init_ocr()          # PaddleOCR 초기화
-        self._init_publisher()    # AudioNoteVector 퍼블리셔 생성
-        self._init_subscribers()  # ROS2 토픽 구독 등록 (카메라 + 모드 명령)
+        self._init_ocr()          # PaddleOCR 초기화 (fallback)
+        self._init_gcv()          # Google Cloud Vision 초기화 (1순위)
+        self._init_cmd_subscribers()  # /robot2/start + /robot3/start 구독
 
         # 업로드·OCR 전담 데몬 스레드 시작 (메인 루프 블로킹 방지)
         threading.Thread(target=self._upload_worker, daemon=True).start()
 
         cv2.namedWindow("Parking Detection", cv2.WINDOW_NORMAL)
         cv2.resizeWindow("Parking Detection", YOLO_IMG_SIZE, YOLO_IMG_SIZE)
-        self.get_logger().info("Node ready. Waiting for 'amr_start' or 'cctv_start'...")
+        self.get_logger().info(
+            "Node ready. /robot2/start 또는 /robot3/start 대기 중..."
+        )
 
     # ── 초기화 메서드들 ──────────────────────────
 
@@ -241,15 +269,11 @@ class ParkingDetectionNode(Node):
 
     def _init_ocr(self):
         '''
-        PaddleOCR 인스턴스를 초기화한다.
+        PaddleOCR 인스턴스를 초기화한다. (GCV 실패 시 fallback)
 
-        전처리(이진화·Unwarp) 없이 원본 컬러 이미지를 직접 입력할 때
-        가장 높은 인식률을 보였으므로, 이미지 전처리 파이프라인은 제거되었다.
-
-        주요 파라미터:
-          lang="korean"              : 한국어 + 영어·숫자 혼합 인식 (번호판 형식에 적합)
-          use_textline_orientation=True : 기울어진 텍스트 자동 각도 보정
-          enable_mkldnn=False        : C++ 백엔드(oneDNN) 에러 우회
+        벤치마크 결과:
+          - 원본(101x30)은 오인식. 2x 확대 시 신뢰도 0.97로 정확 인식.
+          - GCV 연결 실패 시 자동으로 이 엔진이 사용된다.
         '''
         try:
             self.ocr_reader = PaddleOCR(
@@ -261,43 +285,114 @@ class ParkingDetectionNode(Node):
         except Exception as e:
             self.get_logger().error(f"PaddleOCR init failed: {e}")
 
-    def _init_publisher(self):
-        ''' AudioNoteVector 퍼블리셔를 생성한다. amr_start 모드에서 알림음 송신에 사용된다. '''
-        self.audio_pub = self.create_publisher(AudioNoteVector, TOPIC_AUDIO, 10)
+    def _init_gcv(self):
+        '''
+        Google Cloud Vision API 클라이언트를 초기화한다. (1순위 OCR)
 
-    def _init_subscribers(self):
+        벤치마크 결과 GCV는 원본 이미지(101x30)에서도 전처리 없이 "097하0228"을
+        완벽하게 인식했으며, 7종 변형 중 6종에서 정확했다.
+
+        인증: GOOGLE_VISION_CRED_PATH 파일을 환경변수로 설정.
+        실패해도 노드는 계속 실행되며, OCR 호출 시 PaddleOCR fallback으로 전환된다.
         '''
-        두 종류의 토픽을 구독한다.
-          - TOPIC_RGB : 카메라 이미지 (BEST_EFFORT QoS, 최신 1프레임만 유지)
-          - TOPIC_CMD : 모드 명령 문자열 ("amr_start" | "cctv_start")
-        카메라는 모드가 설정되지 않아도 항상 수신 준비 상태를 유지하며,
-        image_callback 내부에서 mode가 None이면 탐지를 스킵한다.
+        import os
+        try:
+            os.environ.setdefault("GOOGLE_APPLICATION_CREDENTIALS", GOOGLE_VISION_CRED_PATH)
+            self.gcv_client = vision.ImageAnnotatorClient()
+            self.get_logger().info("Google Cloud Vision initialized.")
+        except Exception as e:
+            self.get_logger().error(f"GCV init failed (PaddleOCR fallback 사용): {e}")
+
+    def _init_cmd_subscribers(self):
         '''
-        cam_qos = QoSProfile(
-            reliability=ReliabilityPolicy.BEST_EFFORT,   # 패킷 손실 허용, 실시간성 우선
-            history=HistoryPolicy.KEEP_LAST,             # 가장 최근 메시지만 유지
-            depth=1                                       # 큐 크기 1: 오래된 프레임 즉시 폐기
+        robot2 / robot3 의 start 토픽을 각각 별도 콜백으로 구독한다.
+        콜백을 분리해야 발신 네임스페이스를 정확히 알 수 있다.
+        '''
+        self.create_subscription(
+            String, TOPIC_CMD_ROBOT2,
+            lambda msg: self.cmd_callback(msg, "/robot2"), 10
         )
-        self.create_subscription(CompressedImage, TOPIC_RGB, self.image_callback, cam_qos)
-        self.create_subscription(String, TOPIC_CMD, self.cmd_callback, 10)
+        self.create_subscription(
+            String, TOPIC_CMD_ROBOT3,
+            lambda msg: self.cmd_callback(msg, "/robot3"), 10
+        )
+        self.get_logger().info(f"CMD 구독: {TOPIC_CMD_ROBOT2}, {TOPIC_CMD_ROBOT3}")
+
+    def _activate_robot(self, ns: str):
+        '''
+        명령을 보낸 로봇의 네임스페이스(ns)로 카메라 구독·퍼블리셔를 (재)생성한다.
+        같은 로봇에서 반복 명령이 오면 재생성하지 않는다.
+        다른 로봇으로 전환되면 기존 구독을 해제하고 새로 만든다.
+        '''
+        if self.ns == ns:   # 이미 같은 로봇 활성 중 → 스킵
+            return
+
+        self.ns = ns
+        topic_rgb  = f"{ns}/oakd/rgb/image_raw/compressed"
+        topic_audio = f"{ns}/cmd_audio"
+        topic_done  = f"{ns}/capture_done"
+
+        # ── 기존 카메라 구독 해제 ──
+        if self._cam_sub is not None:
+            self.destroy_subscription(self._cam_sub)
+            self._cam_sub = None
+
+        # ── 카메라 구독 (BEST_EFFORT — OAK-D 드라이버가 BEST_EFFORT로 퍼블리시) ──
+        # 구독자가 RELIABLE이면 QoS 협상 실패로 연결 안 맺힘 → BEST_EFFORT 필수
+        cam_qos = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1
+        )
+        self._cam_sub = self.create_subscription(
+            CompressedImage, topic_rgb, self.image_callback, cam_qos
+        )
+
+        # ── 퍼블리셔 재생성 ──
+        self.audio_pub        = self.create_publisher(AudioNoteVector, topic_audio, 10)
+        self.capture_done_pub = self.create_publisher(Bool, topic_done, 10)
+
+        self.get_logger().info(
+            f"[로봇 전환] ns={ns}\n"
+            f"  카메라 구독 : {topic_rgb}\n"
+            f"  오디오 발행 : {topic_audio}\n"
+            f"  완료 발행   : {topic_done}"
+        )
 
     # ── 모드 제어 ────────────────────────────────
 
-    def cmd_callback(self, msg: String):
+    def cmd_callback(self, msg: String, ns: str):
         '''
         std_msgs/String 토픽으로 모드 명령을 수신한다.
+        ns: 발신 로봇 네임스페이스 ("/robot2" | "/robot3") — lambda 로 주입됨
 
-        "amr_start"  → 단속 타이머 30초, Santa Claus 알림음 스레드 시작
-        "cctv_start" → 단속 타이머 5초,  알림음 없음
+        "amr_start"        → 단속 타이머 30초, Santa Claus 알림음 스레드 시작
+        "cctv_start"       → 단속 타이머 5초,  알림음 없음
+        "cctv_start:<key>" → 위와 동일 + cctv_detections 케이스 키 보관
 
-        동일 모드가 중복 수신되어도 재설정 없이 무시된다.
-        다른 모드가 수신되면 기존 추적 목록을 초기화하고 새 모드로 전환한다.
+        메시지에 좌표 등 추가 정보가 붙어 있어도 첫 번째 토큰(모드)만 사용한다.
+        ocr_node 는 이미 현장에 도착해 있으므로 좌표는 불필요하다.
+
+        동일 모드 중복 수신 시 무시. 모드 전환 시 기존 추적 목록을 초기화한다.
         '''
-        cmd = msg.data.strip()
+        raw = msg.data.strip()
 
-        if cmd not in ("amr_start", "cctv_start"):
-            self.get_logger().warn(f"알 수 없는 명령: '{cmd}'. 'amr_start' 또는 'cctv_start'만 허용.")
+        # ── 첫 번째 토큰만으로 모드를 결정한다 ──────────────────────────────
+        token = raw.split(":")[0]
+
+        if token == "amr_start":
+            cmd                = "amr_start"
+            self.cctv_case_key = None
+        elif token == "cctv_start":
+            cmd                = "cctv_start"
+            parts              = raw.split(":", 2)
+            self.cctv_case_key = parts[1] if len(parts) >= 2 and parts[1] else None
+        else:
+            self.get_logger().warn(f"알 수 없는 명령: '{raw}'. 'amr_start' 또는 'cctv_start' 만 허용.")
             return
+
+        # ── 해당 로봇의 카메라·퍼블리셔 활성화 ──────────────────────────────
+        self._activate_robot(ns)
 
         if self.mode == cmd:   # 동일 모드 중복 수신 → 무시
             return
@@ -305,17 +400,19 @@ class ParkingDetectionNode(Node):
         # 모드 전환: 기존 추적 초기화 및 진행 중인 알림음 스레드 정리
         self.mode             = cmd
         self.tracked_vehicles = []
-        self._audio_stop_event.set()   # 기존 알림음 스레드에 종료 신호
+        self._audio_stop_event.set()
 
         if cmd == "amr_start":
             self.parking_timeout = PARKING_TIMEOUT_AMR
-            self.get_logger().info(f"[MODE] amr_start — 타이머 {PARKING_TIMEOUT_AMR:.0f}초, 알림음 활성")
-            # 알림음 스레드 시작: 30초 동안 Santa Claus 멜로디 퍼블리시
-            self._audio_stop_event.clear()   # 이전 종료 신호 리셋 후 새 스레드 시작
+            self.get_logger().info(f"[MODE] amr_start ({ns}) — 타이머 {PARKING_TIMEOUT_AMR:.0f}초, 알림음 활성")
+            self._audio_stop_event.clear()
             threading.Thread(target=self._play_santa, daemon=True).start()
         else:
             self.parking_timeout = PARKING_TIMEOUT_CCTV
-            self.get_logger().info(f"[MODE] cctv_start — 타이머 {PARKING_TIMEOUT_CCTV:.0f}초, 알림음 없음")
+            self.get_logger().info(
+                f"[MODE] cctv_start ({ns}) — 타이머 {PARKING_TIMEOUT_CCTV:.0f}초, "
+                f"케이스 키: {self.cctv_case_key or '없음'}"
+            )
 
     # ── 알림음 ───────────────────────────────────
 
@@ -367,17 +464,21 @@ class ParkingDetectionNode(Node):
 
         처리 순서:
           1. CompressedImage → OpenCV 프레임 디코딩
-          2. YOLO로 차량·번호판 탐지
-          3. 번호판이 차량 내부에 있는지 Overlap 검증 → 유효한 쌍 생성
-          4. 여러 쌍 중 bbox 면적 최대 차량 1대만 선택
-          5. IoU 기반 추적 갱신 및 단속 타이머 판정
-          6. 모니터링 화면 업데이트
+          2. mode가 None이면 화면만 표시하고 탐지 스킵
+          3. YOLO로 차량·번호판 탐지
+          4. 번호판이 차량 내부에 있는지 Overlap 검증 → 유효한 쌍 생성
+          5. 여러 쌍 중 bbox 면적 최대 차량 1대만 선택
+          6. IoU 기반 추적 갱신 및 단속 타이머 판정
+          7. 모니터링 화면 업데이트
         '''
-        if self.mode is None:   # 모드 미설정 시 탐지 스킵 (amr_start/cctv_start 수신 전)
-            return
-
         frame = cv2.imdecode(np.array(msg.data, dtype=np.uint8), cv2.IMREAD_COLOR)
         if frame is None:   # 이미지 디코딩 실패 시 (손상된 패킷 등) 즉시 반환
+            self.get_logger().warn("이미지 디코딩 실패", throttle_duration_sec=5.0)
+            return
+
+        if self.mode is None:   # 모드 미설정 시 탐지 스킵, 화면은 표시
+            cv2.imshow("Parking Detection", frame)
+            cv2.waitKey(1)
             return
 
         cars, ids       = self._detect(frame)   # 차량·번호판 탐지
@@ -521,6 +622,15 @@ class ParkingDetectionNode(Node):
             if not track.confirmed_uploaded and track.elapsed() >= self.parking_timeout:
                 self._enqueue(frame, track, event="confirmed")   # 30초 초과 시 확정 업로드
                 track.confirmed_uploaded = True                  # 이후 재업로드 방지
+
+                # ── 촬영 완료 신호 퍼블리시 ──────────────────────────────────
+                # confirmed 이벤트가 큐에 투입된 직후 capture_done = True 를 발행한다.
+                # 수신 측(네비게이션 등)은 이 신호를 받아 AMR 이동·다음 임무를 진행한다.
+                done_msg      = Bool()
+                done_msg.data = True
+                self.capture_done_pub.publish(done_msg)
+                self.get_logger().info("[capture_done] True 퍼블리시")
+
             next_tracks.append(track)   # confirmed 여부 무관하게 추적 목록 유지
 
         self.tracked_vehicles = next_tracks   # 추적 목록을 다음 프레임용으로 교체
@@ -542,11 +652,13 @@ class ParkingDetectionNode(Node):
 
         try:
             self.save_queue.put_nowait({
-                "event":      event,                                         # "initial" 또는 "confirmed"
-                "frame":      frame.copy(),                                  # 전체 프레임 (원본 보존을 위해 복사)
-                "plate_crop": plate_crop.copy() if plate_crop.size > 0 else None,  # 번호판 크롭 (없으면 None)
-                "car_det":    track.car_det,                                 # 차량 bbox 딕셔너리
-                "id_det":     track.id_det,                                  # 번호판 bbox 딕셔너리
+                "event":         event,                                         # "initial" 또는 "confirmed"
+                "frame":         frame.copy(),                                  # 전체 프레임 (원본 보존을 위해 복사)
+                "plate_crop":    plate_crop.copy() if plate_crop.size > 0 else None,  # 번호판 크롭 (없으면 None)
+                "car_det":       track.car_det,                                 # 차량 bbox 딕셔너리
+                "id_det":        track.id_det,                                  # 번호판 bbox 딕셔너리
+                "mode":          self.mode,                                     # 큐 투입 시점 모드 스냅샷
+                "cctv_case_key": self.cctv_case_key,                            # cctv_start 케이스 키 스냅샷
             })
         except queue.Full:
             self.get_logger().warn(f"Queue full. '{event}' image dropped.")  # 큐 포화 시 드랍 경고
@@ -627,11 +739,13 @@ class ParkingDetectionNode(Node):
         if self.db_ref is None:   # Firebase 미연결 시 업로드 스킵
             return
 
-        event      = item["event"]
-        frame      = item["frame"]
-        plate_crop = item["plate_crop"]
-        now_dt     = datetime.datetime.now()
-        now_iso    = now_dt.isoformat()   # "2025-03-11T14:23:05.123456"
+        event         = item["event"]
+        frame         = item["frame"]
+        plate_crop    = item["plate_crop"]
+        item_mode     = item.get("mode")          # 큐 투입 시점 모드 (self.mode 는 이미 바뀔 수 있음)
+        cctv_case_key = item.get("cctv_case_key") # webcam_detector 가 생성한 케이스 키
+        now_dt        = datetime.datetime.now()
+        now_iso       = now_dt.isoformat()   # "2025-03-11T14:23:05.123456"
 
         if event == "initial":
             # ── 최초 감지: 새 케이스 경로 생성 + 전체 프레임 저장 ──
@@ -651,14 +765,29 @@ class ParkingDetectionNode(Node):
             })
             self.get_logger().info(f"[initial]   key: {case_key}")
 
+            # ── cctv_start 모드: cctv_detections/<case_key> 에 AMR 초기 프레임 탭 추가 ──
+            if item_mode == "cctv_start" and cctv_case_key:
+                self.db_ref.reference(
+                    f"{FIREBASE_CCTV_DB_PATH}/{cctv_case_key}"
+                ).update({
+                    "amr_initial_image": self._to_b64(frame),   # AMR 도착 시 차량 전체 프레임
+                    "amr_detected_at":   now_iso,
+                })
+                self.get_logger().info(f"[cctv/initial] AMR 초기 이미지 → cctv_detections/{cctv_case_key}")
+
         elif event == "confirmed":
             if self.current_case_ref is None:   # initial 없이 confirmed 가 먼저 오는 예외 상황 방어
                 self.get_logger().warn("[confirmed] current_case_ref 없음. 업로드 스킵.")
                 return
 
             # ── 확정: OCR 수행 후 증거 필드 추가 ──
-            # PaddleOCR은 원본 컬러 크롭 이미지를 직접 입력할 때 인식률이 가장 높다.
-            plate_number = self._ocr_paddle(plate_crop) if plate_crop is not None else "UNKNOWN"
+            # 1순위 GCV → 실패 시 PaddleOCR fallback
+            plate_number = "UNKNOWN"
+            if plate_crop is not None:
+                if self.gcv_client is not None:
+                    plate_number = self._ocr_gcv(plate_crop)
+                if plate_number == "UNKNOWN" and self.ocr_reader is not None:
+                    plate_number = self._ocr_paddle(plate_crop)
 
             # initial 때 저장한 동일 경로에 증거 필드 추가 (initial_image 등 기존 필드 보존)
             self.current_case_ref.update({
@@ -672,45 +801,141 @@ class ParkingDetectionNode(Node):
                 f"[confirmed] Plate: {plate_number}  at {now_dt.strftime('%H:%M:%S')}"
             )
 
+            # ── cctv_start 모드: cctv_detections/<case_key> 에 번호판 + AMR 증거 프레임 추가 ──
+            # webcam_detector 가 이미 생성해 둔 케이스에 AMR 이 찍은 증거를 merge 한다.
+            # DB 구조 (최종):
+            #   cctv_detections/<webcam_case_key>/
+            #     ├── (webcam 이 채운 필드들 — first_seen/confirmed 이미지·타임스탬프)
+            #     ├── amr_initial_image   ← AMR 도착 직후 전체 프레임  (initial 이벤트)
+            #     ├── amr_evidence_image  ← AMR 확정 시점 전체 프레임  (confirmed 이벤트)
+            #     ├── plate_image         ← 번호판 크롭
+            #     └── plate_number        ← OCR 결과
+            if item_mode == "cctv_start" and cctv_case_key:
+                self.db_ref.reference(
+                    f"{FIREBASE_CCTV_DB_PATH}/{cctv_case_key}"
+                ).update({
+                    "amr_evidence_image": self._to_b64(frame),
+                    "amr_confirmed_at":   now_iso,
+                    "plate_image":        self._to_b64(plate_crop) if plate_crop is not None else None,
+                    "plate_number":       plate_number,
+                })
+                self.get_logger().info(
+                    f"[cctv/confirmed] 번호판 {plate_number} → cctv_detections/{cctv_case_key}"
+                )
+
+    def _ocr_gcv(self, img: np.ndarray) -> str:
+        '''
+        Google Cloud Vision API로 번호판 이미지를 인식한다. (1순위)
+
+        벤치마크 결과: 원본(101x30) 그대로도 전처리 없이 "097하0228" 완벽 인식.
+        언어 힌트를 한국어("ko")로 고정해 한글이 영문·숫자로 오인되는 것을 방지한다.
+        API 오류 또는 빈 결과 시 "UNKNOWN" 반환 → PaddleOCR fallback으로 이어짐.
+        '''
+        try:
+            _, buf    = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 95])
+            gcv_image = vision.Image(content=buf.tobytes())
+            context   = vision.ImageContext(language_hints=["ko"])
+            response  = self.gcv_client.document_text_detection(
+                image=gcv_image, image_context=context
+            )
+            if response.error.message:
+                self.get_logger().warn(f"GCV API 오류: {response.error.message}")
+                return "UNKNOWN"
+            text = response.full_text_annotation.text.replace(" ", "").replace("\n", "")
+            result = text if text else "UNKNOWN"
+            self.get_logger().info(f"[OCR/GCV] → '{result}'")
+            return result
+        except Exception as e:
+            self.get_logger().warn(f"GCV 호출 실패: {e}")
+            return "UNKNOWN"
+
     def _ocr_paddle(self, img: np.ndarray) -> str:
         '''
-        PaddleOCR로 번호판 이미지를 인식하고 텍스트를 반환한다.
+        PaddleOCR로 번호판 이미지를 인식한다. (GCV 실패 시 fallback)
 
-        원본 컬러 크롭 이미지를 전처리 없이 직접 입력한다.
-        여러 차례 테스트 결과, 전처리가 없을 때 인식률이 가장 높았다.
-
-        반환값 구조 처리:
-          PaddleOCR 최신 버전(PaddleX 기반)은 predict() 메서드를 사용하며,
-          결과 객체가 get_res()를 가진 경우와 리스트 형태 두 가지를 모두 처리한다.
-          신뢰도(score) 0.6 미만 결과는 오인식으로 간주하고 제외한다.
+        벤치마크 결과:
+          - 원본(101x30)은 오인식(0.62). 2x 확대 시 0.97로 정확 인식.
+          - 원본과 180° 회전본 모두 시도해 신뢰도 합산이 높은 쪽을 채택한다.
+        키 이름: PaddleX OCRResult는 rec_texts / rec_scores (복수형) 사용.
         '''
+        
         if self.ocr_reader is None or img is None:
             return "UNKNOWN"
-        try:
-            results = self.ocr_reader.predict(img)
+ 
+        def _run_ocr(image: np.ndarray) -> tuple[list[str], list[float]]:
+            '''단일 이미지에 대해 OCR을 실행하고 (texts, scores) 튜플을 반환한다.'''
+            results = self.ocr_reader.predict(image)
             if not isinstance(results, list):
-                results = list(results)   # 제너레이터일 경우 리스트로 변환
-
-            texts = []
+                results = list(results)
+ 
+            texts, scores = [], []
             for res in results:
-                if hasattr(res, "get_res"):                          # PaddleX 객체 형태
-                    d = res.get_res()
-                    for t, s in zip(d.get("rec_text", []), d.get("rec_score", [])):
-                        if s >= 0.6:
+                # ── PaddleX OCRResult: dict-like 객체 (rec_texts / rec_scores, 복수형) ──
+                if hasattr(res, "__getitem__") or isinstance(res, dict):
+                    try:
+                        for t, s in zip(res["rec_texts"], res["rec_scores"]):
                             texts.append(t)
-                elif isinstance(res, list):                          # 구버전 리스트 형태
+                            scores.append(s)
+                        continue
+                    except (KeyError, TypeError):
+                        pass
+ 
+                # ── PaddleX: get_res() 메서드가 있는 경우 (구형 API) ──
+                if hasattr(res, "get_res"):
+                    d = res.get_res()
+                    for t, s in zip(d.get("rec_texts", d.get("rec_text", [])),
+                                    d.get("rec_scores", d.get("rec_score", []))):
+                        texts.append(t)
+                        scores.append(s)
+ 
+                # ── 구버전: 리스트 형태 [[bbox, [text, score]], ...] ──
+                elif isinstance(res, list):
                     for line in res:
-                        if len(line) >= 2 and isinstance(line[1], (list, tuple)):
-                            t, s = line[1][0], line[1][1]
-                            if s >= 0.6:
-                                texts.append(t)
-
-            result = "".join(texts).replace(" ", "")
+                        try:
+                            if len(line) >= 2 and isinstance(line[1], (list, tuple)):
+                                texts.append(line[1][0])
+                                scores.append(line[1][1])
+                        except Exception:
+                            pass
+ 
+            return texts, scores
+ 
+        try:
+            # ── 이미지가 너무 작으면 확대 (height < 60px 기준) ──
+            h, w = img.shape[:2]
+            if h < 60:
+                scale = max(2, 60 // h)
+                img   = cv2.resize(img, (w * scale, h * scale), interpolation=cv2.INTER_CUBIC)
+ 
+            # ── 원본 방향과 180° 회전 모두 시도 → 신뢰도 합산이 높은 쪽 채택 ──
+            img_180 = cv2.rotate(img, cv2.ROTATE_180)
+ 
+            texts_orig, scores_orig = _run_ocr(img)
+            texts_180,  scores_180  = _run_ocr(img_180)
+ 
+            sum_orig = sum(s for s in scores_orig if s >= 0.6)
+            sum_180  = sum(s for s in scores_180  if s >= 0.6)
+ 
+            if sum_180 > sum_orig:
+                texts, scores = texts_180, scores_180
+                self.get_logger().info("[OCR] 180° 회전본이 신뢰도 높음 → 회전본 사용")
+            else:
+                texts, scores = texts_orig, scores_orig
+ 
+            # ── 신뢰도 0.6 미만 제거 후 결합 ──
+            filtered = [t for t, s in zip(texts, scores) if s >= 0.6]
+            result   = "".join(filtered).replace(" ", "")
+ 
+            self.get_logger().info(
+                f"[OCR] texts={texts}  scores={[round(s,3) for s in scores]}  "
+                f"→ '{result}'"
+            )
             return result if result else "UNKNOWN"
+ 
         except Exception as e:
             self.get_logger().warn(f"PaddleOCR 호출 실패: {e}")
             return "UNKNOWN"
-
+    
     @staticmethod
     def _to_b64(img: np.ndarray) -> str:
         '''
