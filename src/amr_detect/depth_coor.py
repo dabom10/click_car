@@ -48,7 +48,7 @@ YOLO_IMG_SIZE    = 704
 TOPIC_RGB        = f"{ROBOT_NAMESPACE}/oakd/rgb/image_raw/compressed"
 TOPIC_DEPTH      = f"{ROBOT_NAMESPACE}/oakd/stereo/image_raw/compressedDepth"
 TOPIC_INFO       = f"{ROBOT_NAMESPACE}/oakd/rgb/camera_info"
-TOPIC_AMR_TARGET = f"{ROBOT_NAMESPACE}amr_done"
+TOPIC_AMR_TARGET = f"{ROBOT_NAMESPACE}/amr_done"
 TOPIC_ODOM       = f"{ROBOT_NAMESPACE}/odom"   # world frame 변환용
 
 # ── 카메라 → 로봇 베이스 오프셋 (단위: m) ──────────────
@@ -75,6 +75,11 @@ DEPTH_PERCENTILE       = 10
 
 # RGB–Depth 동기화
 MAX_DEPTH_AGE_SEC = 0.15
+
+# ── ROI 필터 ──────────────────────────────────
+# 카메라 뷰 상단 30%는 car가 절대 나올 수 없는 영역 (천장/배경)
+# → 해당 영역에 bbox 중심이 있으면 오탐으로 간주하고 무시
+ROI_TOP_RATIO = 0.30   # 0.0~1.0, 상단 몇 % 를 제외할지
 
 # ── EKF 파라미터 ──────────────────────────────
 # 프로세스 노이즈 Q: 정지 모델용 (매우 작게)
@@ -522,12 +527,23 @@ class ParkingDetectionNode(Node):
         cars = []
         if not results:
             return cars
+
+        h_frame = frame.shape[0]
+        roi_top_px = int(h_frame * ROI_TOP_RATIO)  # 상단 제외 픽셀 경계선
+
         for box in results[0].boxes:
             cls_id = int(box.cls[0].item())
             name   = self.model.names.get(cls_id, str(cls_id))
             if name != "car":
                 continue
             x1, y1, x2, y2 = map(int, box.xyxy[0].cpu().numpy())
+
+            # ── 상단 ROI 필터 ──
+            # bbox 하단(y2)이 roi_top_px보다 위에 있으면 제거
+            # bbox 중심이 아닌 하단 기준: 차량 하단이 ROI 경계 아래 있어야 유효
+            if y2 <= roi_top_px:
+                continue
+
             cars.append({
                 "class_name": name,
                 "conf":  float(box.conf[0].item()),
@@ -661,6 +677,15 @@ class ParkingDetectionNode(Node):
     def _draw(self, frame: np.ndarray, smoothed_targets: list):
         if not self.gui_enabled:
             return
+
+        # ── ROI 경계선 표시 (상단 제외 영역) ──
+        h_frame = frame.shape[0]
+        roi_top_px = int(h_frame * ROI_TOP_RATIO)
+        cv2.line(frame, (0, roi_top_px), (frame.shape[1], roi_top_px),
+                 (0, 165, 255), 1)   # 주황색 점선 느낌
+        cv2.putText(frame, f"ROI top ({int(ROI_TOP_RATIO*100)}%)",
+                    (5, roi_top_px - 5),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 165, 255), 1)
 
         for idx, (det, smoothed) in enumerate(smoothed_targets, 1):
             x1, y1, x2, y2 = det["x1"], det["y1"], det["x2"], det["y2"]
