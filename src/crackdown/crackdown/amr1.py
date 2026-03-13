@@ -127,6 +127,14 @@ ENFORCEMENT_STOP_DIST = 0.7    # 목표 차량으로부터 정지할 거리 (미
 TASK_POLL_PERIOD_SEC  = 0.1
 BATTERY_LOW_THRESHOLD = 0.25   # 배터리 복귀 기준 (25%)
 
+# ── 상태 publish 설정 ─────────────────────────────────
+STATUS_PUBLISH_PERIOD_SEC = 0.5
+
+STATUS_PATROL = "patrol"
+STATUS_ENFORCE = "enforce"
+STATUS_RETURNING = "returning"
+STATUS_CHARGING = "charging"
+
 # ================================
 # 단속 출처 상수
 # ================================
@@ -296,6 +304,9 @@ class AMRNode(Node):
         self.current_x      = 0.0
         self.current_y      = 0.0
 
+        # ── 현재 상태 문자열 ────────────────────────────
+        self.current_status = STATUS_CHARGING
+
         # ── Navigator ────────────────────────────────
         self.navigator = TurtleBot4Navigator()
 
@@ -337,14 +348,45 @@ class AMRNode(Node):
             10
         )
 
+        self.create_timer(
+            STATUS_PUBLISH_PERIOD_SEC,
+            self.publish_status
+        )
+
         # ── 발행 ─────────────────────────────────────
         self.cctv_start_pub = self.create_publisher(Bool, f'/{robot_ns}/cctv_start', 10)
         self.amr_start_pub  = self.create_publisher(Bool, f'/{robot_ns}/amr_start',  10)
+        # ── 상태 퍼블리셔 ──────────────────────────────
+        self.status_pub = self.create_publisher(
+            String,
+            f'{robot_ns}_status',
+            10
+        )
 
         self.get_logger().info(f'[{robot_ns}] 초기화 완료')
 
-    # ── 콜백 ─────────────────────────────────────────
+    def set_status(self, status: str):
+        """
+        현재 AMR 상태 문자열을 갱신.
+        """
+        with self.state_lock:
+            if self.current_status != status:
+                self.current_status = status
+                self.get_logger().info(f'status 변경 → {status}')
 
+    def publish_status(self):
+        """
+        현재 상태를 주기적으로 publish.
+        charging 상태도 계속 publish되도록 타이머 기반으로 전송.
+        """
+        with self.state_lock:
+            status = self.current_status
+
+        msg = String()
+        msg.data = status
+        self.status_pub.publish(msg)
+
+    # ── 콜백 ─────────────────────────────────────────
     def patrol_command_callback(self, msg):
         with self.state_lock:
             if msg.data == 'start':
@@ -433,6 +475,8 @@ def patrol_cycle(node: AMRNode, is_first_cycle: bool = False):
         node.battery_low    = False
         node.capture_done   = False
 
+    node.set_status(STATUS_CHARGING)
+
     while rclpy.ok():
         with node.state_lock:
             if node.start_patrol:
@@ -448,6 +492,7 @@ def patrol_cycle(node: AMRNode, is_first_cycle: bool = False):
         navigator.setInitialPose(initial_pose)
         navigator.waitUntilNav2Active()
     navigator.undock()
+    node.set_status(STATUS_PATROL)
     navigator.info('순찰 시작!')
 
     current_mode = MODE_PATROL
@@ -475,10 +520,12 @@ def patrol_cycle(node: AMRNode, is_first_cycle: bool = False):
             with node.state_lock:
                 node.stop_requested = True
             local_stop = True
+            node.set_status(STATUS_RETURNING)
             navigator.warn('[배터리] 부족 → 현재 작업 완료 후 도킹 복귀')
 
         # ── 단속 실행 ────────────────────────────────
         if current_mode == MODE_ENFORCEMENT:
+            node.set_status(STATUS_ENFORCE)
             do_enforcement(
                 navigator, node,
                 enforcement_x, enforcement_y,
@@ -486,6 +533,8 @@ def patrol_cycle(node: AMRNode, is_first_cycle: bool = False):
             )
             with node.state_lock:
                 node.stop_requested = True
+
+            node.set_status(STATUS_RETURNING)
             current_mode = MODE_PATROL
             navigator.info(
                 f'단속 완료 → '
@@ -512,6 +561,8 @@ def patrol_cycle(node: AMRNode, is_first_cycle: bool = False):
                 enforcement_y      = local_target_y
                 enforcement_source = local_source
                 current_mode = MODE_ROUTE_TO_ZONE
+
+                node.set_status(STATUS_ENFORCE)
                 navigator.info(
                     f'[{local_source}] 목표 ({local_target_x}, {local_target_y}) → '
                     f'구역 {target_zone_id}, '
@@ -522,6 +573,7 @@ def patrol_cycle(node: AMRNode, is_first_cycle: bool = False):
 
         # ── stop 조건: waypoint 0 도착 후 도킹 ──────
         if local_stop and patrol_pos == 0:
+            node.set_status(STATUS_RETURNING)
             navigator.info('마지막 waypoint 9 완료 → Pre-dock 이동 후 도킹')
             break
 
@@ -529,10 +581,13 @@ def patrol_cycle(node: AMRNode, is_first_cycle: bool = False):
         current_waypoint_index = patrol_pos_to_waypoint_index(patrol_pos)
 
         if current_mode == MODE_ROUTE_TO_ZONE:
+            node.set_status(STATUS_ENFORCE)
             log = f'구역 {target_zone_id}로 이동 중'
         elif local_stop:
+            node.set_status(STATUS_RETURNING)
             log = '도킹 복귀 중'
         else:
+            node.set_status(STATUS_PATROL)
             log = '순찰'
 
         move_to_waypoint(navigator, current_waypoint_index, log)
@@ -546,11 +601,13 @@ def patrol_cycle(node: AMRNode, is_first_cycle: bool = False):
         ):
             current_mode = MODE_ENFORCEMENT
             patrol_pos   = target_zone_resume_patrol_pos
+            node.set_status(STATUS_ENFORCE)
             navigator.info(f'구역 {target_zone_id} 첫 waypoint 도착 → 단속 실행')
 
+    node.set_status(STATUS_RETURNING)
     move_to_pre_dock_and_dock(navigator)
+    node.set_status(STATUS_CHARGING)
     navigator.info('도킹 완료 → 다음 출발 신호 대기')
-
 
 def main():
     rclpy.init()
