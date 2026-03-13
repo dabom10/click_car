@@ -32,6 +32,7 @@ from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 from sensor_msgs.msg import CompressedImage, CameraInfo
 from std_msgs.msg import String
+from nav_msgs.msg import Odometry
 from ultralytics import YOLO
 
 
@@ -48,6 +49,15 @@ TOPIC_RGB        = f"{ROBOT_NAMESPACE}/oakd/rgb/image_raw/compressed"
 TOPIC_DEPTH      = f"{ROBOT_NAMESPACE}/oakd/stereo/image_raw/compressedDepth"
 TOPIC_INFO       = f"{ROBOT_NAMESPACE}/oakd/rgb/camera_info"
 TOPIC_AMR_TARGET = f"{ROBOT_NAMESPACE}amr_done"
+TOPIC_ODOM       = f"{ROBOT_NAMESPACE}/odom"   # world frame 변환용
+
+# ── 카메라 → 로봇 베이스 오프셋 (단위: m) ──────────────
+# OAK-D Lite가 로봇 중심에서 앞쪽으로 얼마나 떨어져 있는지.
+# TurtleBot4 기준 대략적인 값 — 실측 후 교체 권장.
+# 실측 방법: 줄자로 로봇 중심(회전축)에서 카메라 렌즈까지 측정
+CAM_OFFSET_X = -0.10  # 로봇 중심 기준 앞뒤 (m) — 뒤쪽이면 음수, 실측 -10cm
+CAM_OFFSET_Y =  0.00  # 로봇 중심 기준 좌우 (m) — 정중앙
+CAM_OFFSET_Z =  0.25  # 지면에서 카메라 렌즈까지 높이 (m) — 실측 25cm
 
 WINDOW_NAME      = "Parking Detection"
 PUBLISH_INTERVAL = 0.2
@@ -296,6 +306,12 @@ class ParkingDetectionNode(Node):
         self._depth_lock        = threading.Lock()
         self.tracks             = []
 
+        # ── odom: AMR 현재 위치/방향 (world frame 변환용) ──
+        # odom이 없으면 카메라 상대 좌표 그대로 publish (fallback)
+        self._odom_x   = None   # AMR x (m)
+        self._odom_y   = None   # AMR y (m)
+        self._odom_yaw = None   # AMR yaw (rad)
+
         self._load_model()
         self._init_subscriber()
         self._init_publisher()
@@ -328,8 +344,10 @@ class ParkingDetectionNode(Node):
         self.create_subscription(CompressedImage, TOPIC_RGB,   self.image_callback, qos_be)
         self.create_subscription(CompressedImage, TOPIC_DEPTH, self.depth_callback, qos_be)
         self.create_subscription(CameraInfo,      TOPIC_INFO,  self.info_callback,  qos_rel)
+        self.create_subscription(Odometry,        TOPIC_ODOM,  self.odom_callback,  qos_be)
         self.get_logger().info(f"Sub RGB  : {TOPIC_RGB}")
         self.get_logger().info(f"Sub Depth: {TOPIC_DEPTH}")
+        self.get_logger().info(f"Sub Odom : {TOPIC_ODOM}")
 
     def _init_publisher(self):
         qos_pub = QoSProfile(reliability=ReliabilityPolicy.RELIABLE,
@@ -375,7 +393,61 @@ class ParkingDetectionNode(Node):
             f"cy={self.camera_info['cy']:.1f} "
             f"res={msg.width}x{msg.height}")
 
-    # ── Depth 디코드 ─────────────────────────────────────
+    # ── Odometry ─────────────────────────────────────────
+    def odom_callback(self, msg: Odometry):
+        """
+        AMR의 현재 world frame 위치/방향을 저장.
+        quaternion → yaw 변환 (2D 이동이므로 yaw만 사용).
+        """
+        self._odom_x = msg.pose.pose.position.x
+        self._odom_y = msg.pose.pose.position.y
+
+        # quaternion → yaw
+        q = msg.pose.pose.orientation
+        # yaw = atan2(2(wz + xy), 1 - 2(yy + zz))
+        siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
+        cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+        self._odom_yaw = float(np.arctan2(siny_cosp, cosy_cosp))
+
+    def _camera_to_world(self, cam_x: float, cam_y: float, cam_z: float):
+        """
+        카메라 좌표계 → world(odom) 좌표계 변환.
+
+        카메라 좌표계 (OAK-D, ROS convention):
+          X = 오른쪽, Y = 아래, Z = 앞(depth)
+
+        로봇 베이스 좌표계 (ROS convention):
+          X = 앞, Y = 왼쪽, Z = 위
+
+        카메라 → 로봇 베이스 변환:
+          base_x =  cam_z + CAM_OFFSET_X   (depth → 앞방향)
+          base_y = -cam_x + CAM_OFFSET_Y   (오른쪽 → 왼쪽 반전)
+          base_z = -cam_y + CAM_OFFSET_Z   (아래 → 위 반전, 높이 오프셋)
+
+        로봇 베이스 → world(odom) 변환:
+          world_x = odom_x + base_x*cos(yaw) - base_y*sin(yaw)
+          world_y = odom_y + base_x*sin(yaw) + base_y*cos(yaw)
+
+        odom이 없으면 None 반환 → 상대 좌표 fallback.
+        """
+        if self._odom_x is None:
+            return None   # odom 미수신 → fallback
+
+        # ① camera → robot base
+        base_x =  cam_z + CAM_OFFSET_X
+        base_y = -cam_x + CAM_OFFSET_Y
+        base_z = -cam_y + CAM_OFFSET_Z
+
+        # ② robot base → world (2D rotation, yaw만 사용)
+        cos_y = np.cos(self._odom_yaw)
+        sin_y = np.sin(self._odom_yaw)
+        world_x = self._odom_x + base_x * cos_y - base_y * sin_y
+        world_y = self._odom_y + base_x * sin_y + base_y * cos_y
+        world_z = base_z   # 높이는 회전 불필요
+
+        return (world_x, world_y, world_z)
+
+
     def _decode_compressed_depth(self, msg: CompressedImage):
         try:
             data = bytes(msg.data)
@@ -498,10 +570,23 @@ class ParkingDetectionNode(Node):
 
         u = (det["x1"] + det["x2"]) // 2
         v = det["y2"]
-        Z = depth_mm / 1000.0
-        X = (u - self.camera_info["cx"]) * Z / self.camera_info["fx"]
-        Y = (v - self.camera_info["cy"]) * Z / self.camera_info["fy"]
-        return (X, Y, Z, u, v)
+
+        # ── 카메라 좌표계 (상대 좌표) ──
+        cam_z = depth_mm / 1000.0
+        cam_x = (u - self.camera_info["cx"]) * cam_z / self.camera_info["fx"]
+        cam_y = (v - self.camera_info["cy"]) * cam_z / self.camera_info["fy"]
+
+        # ── world frame 변환 시도 ──
+        world = self._camera_to_world(cam_x, cam_y, cam_z)
+
+        if world is not None:
+            # odom 수신 중 → world 좌표 사용
+            return (world[0], world[1], world[2], u, v)
+        else:
+            # odom 미수신 → 카메라 상대 좌표 fallback (로그 경고)
+            self.get_logger().warn("[ODOM] Not received yet, using camera-relative coords.",
+                                   throttle_duration_sec=5.0)
+            return (cam_x, cam_y, cam_z, u, v)
 
     # ── IoU 트래킹 ───────────────────────────────────────
     @staticmethod
