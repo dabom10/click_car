@@ -15,16 +15,16 @@ from std_msgs.msg import String
 from ultralytics import YOLO
 
 
-ROBOT_NAMESPACE    = "/robot3"
+ROBOT_NAMESPACE    = "/robot2"
 MODEL_PATH         = "/home/rokey/click_car/models/amr.pt"
 
-CONF_THRESHOLD     = 0.50
+CONF_THRESHOLD     = 0.70
 YOLO_IMG_SIZE      = 704
 
 TOPIC_RGB          = f"{ROBOT_NAMESPACE}/oakd/rgb/image_raw/compressed"
 TOPIC_DEPTH        = f"{ROBOT_NAMESPACE}/oakd/stereo/image_raw/compressedDepth"
 TOPIC_INFO         = f"{ROBOT_NAMESPACE}/oakd/rgb/camera_info"
-TOPIC_AMR_TARGET   = f"{ROBOT_NAMESPACE}amr_done"   # std_msgs/String, payload: "x,y,z"
+TOPIC_AMR_TARGET   = f"{ROBOT_NAMESPACE}/amr_done"   # std_msgs/String, payload: "x,y,z"
 
 WINDOW_NAME        = "Parking Detection"
 PUBLISH_INTERVAL   = 0.2
@@ -32,8 +32,13 @@ PUBLISH_INTERVAL   = 0.2
 # 트래킹/스무딩 파라미터
 IOU_THRESH         = 0.30
 TRACK_TTL_SEC      = 1.0
-SMOOTH_WINDOW      = 5
-OUTLIER_THRESH_M   = 0.35   # median 기준 거리 35cm 이상이면 제거
+SMOOTH_WINDOW      = 7           # 기존 5 -> 7
+OUTLIER_THRESH_M   = 0.25        # 기존 0.35 -> 0.25
+
+# 하단 샘플 파라미터
+BOTTOM_Y_OFFSET    = 4           # y2 그대로 말고 약간 위에서 측정
+DEPTH_ROI_KSIZE    = 5           # depth ROI median 크기
+INFRAME_Z_OUTLIER_THRESH_M = 0.20  # 한 프레임 안 3점 샘플 간 Z 편차 허용
 
 
 class Track:
@@ -64,14 +69,14 @@ class Track:
         if len(self.history) == 0:
             return None
 
-        arr = np.array(self.history, dtype=np.float32)  # shape: (N, 5)
+        arr = np.array(self.history, dtype=np.float32)  # (N, 5)
         xyz = arr[:, :3]
         uv  = arr[:, 3:]
 
         # 1차 median
-        xyz_med = np.median(xyz, axis=0)  # (3,)
+        xyz_med = np.median(xyz, axis=0)
 
-        # 각 점과 median 사이 거리
+        # median 기준 거리
         dists = np.linalg.norm(xyz - xyz_med, axis=1)
 
         # outlier 제거
@@ -79,7 +84,6 @@ class Track:
         filtered_xyz = xyz[keep]
         filtered_uv  = uv[keep]
 
-        # 다 제거되면 원본 median 사용
         if filtered_xyz.shape[0] == 0:
             final_xyz = xyz_med
             final_uv = np.median(uv, axis=0)
@@ -285,7 +289,7 @@ class ParkingDetectionNode(Node):
 
         current_measurements = []
         for det in car_dets:
-            xyz_uv = self._get_xyz_from_bottom(det, depth_snap)
+            xyz_uv = self._get_xyz_from_bottom_multi(det, depth_snap)
             current_measurements.append((det, xyz_uv))
 
         self._update_tracks(current_measurements)
@@ -335,14 +339,9 @@ class ParkingDetectionNode(Node):
         return cars
 
     # ──────────────────────────────────────────
-    # 하단 중심 / depth
+    # 하단 다중 샘플 / depth
     # ──────────────────────────────────────────
-    def _get_bottom_center(self, det: dict):
-        u = (det["x1"] + det["x2"]) // 2
-        v = det["y2"]
-        return u, v
-
-    def _get_depth_mm_median(self, u: int, v: int, depth_frame: np.ndarray | None, ksize: int = 5):
+    def _get_depth_mm_median(self, u: int, v: int, depth_frame: np.ndarray | None, ksize: int = DEPTH_ROI_KSIZE):
         if depth_frame is None:
             return None
 
@@ -364,21 +363,58 @@ class ParkingDetectionNode(Node):
 
         return int(np.median(valid))
 
-    def _get_xyz_from_bottom(self, det: dict, depth_frame: np.ndarray | None):
+    def _get_xyz_from_bottom_multi(self, det: dict, depth_frame: np.ndarray | None):
+        """
+        bbox 하단에서 3점 샘플링:
+        - 35%, 50%, 65% 지점
+        - y2보다 약간 위에서(depth hole 회피)
+        - 프레임 내부에서도 outlier 제거 후 median
+        반환: (X, Y, Z, u, v) 또는 None
+        """
         if self.camera_info is None or depth_frame is None:
             return None
 
-        u, v = self._get_bottom_center(det)
-
-        depth_mm = self._get_depth_mm_median(u, v, depth_frame, ksize=5)
-        if depth_mm is None:
+        x1, y1, x2, y2 = det["x1"], det["y1"], det["x2"], det["y2"]
+        w = x2 - x1
+        if w <= 0:
             return None
 
-        Z = depth_mm / 1000.0
-        X = (u - self.camera_info["cx"]) * Z / self.camera_info["fx"]
-        Y = (v - self.camera_info["cy"]) * Z / self.camera_info["fy"]
+        v = max(0, y2 - BOTTOM_Y_OFFSET)
 
-        return (X, Y, Z, u, v)
+        sample_us = [
+            int(x1 + 0.35 * w),
+            int(x1 + 0.50 * w),
+            int(x1 + 0.65 * w),
+        ]
+
+        candidates = []
+        for u in sample_us:
+            depth_mm = self._get_depth_mm_median(u, v, depth_frame, ksize=DEPTH_ROI_KSIZE)
+            if depth_mm is None:
+                continue
+
+            Z = depth_mm / 1000.0
+            X = (u - self.camera_info["cx"]) * Z / self.camera_info["fx"]
+            Y = (v - self.camera_info["cy"]) * Z / self.camera_info["fy"]
+            candidates.append([X, Y, Z, u, v])
+
+        if len(candidates) == 0:
+            return None
+
+        cand = np.array(candidates, dtype=np.float32)
+
+        # 프레임 내 Z median 기준으로 outlier 제거
+        z_med = np.median(cand[:, 2])
+        z_keep = np.abs(cand[:, 2] - z_med) <= INFRAME_Z_OUTLIER_THRESH_M
+        cand_f = cand[z_keep]
+
+        if cand_f.shape[0] == 0:
+            cand_f = cand
+
+        final = np.median(cand_f, axis=0)
+        X, Y, Z, u, v = final
+
+        return (float(X), float(Y), float(Z), int(round(u)), int(round(v)))
 
     # ──────────────────────────────────────────
     # 간단 IoU 트래킹
@@ -396,7 +432,6 @@ class ParkingDetectionNode(Node):
         return inter / (area_a + area_b - inter)
 
     def _update_tracks(self, current_measurements):
-        # 살아있는 트랙만 유지
         self.tracks = [trk for trk in self.tracks if trk.is_alive()]
 
         matched_track_idx = set()
