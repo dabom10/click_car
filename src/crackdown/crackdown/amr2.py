@@ -44,6 +44,7 @@ from sensor_msgs.msg import BatteryState
 
 # ── 웨이포인트 정의 ──────────────────────────────────────
 WAYPOINTS = [
+    ([-0.725, -0.2],  TurtleBot4Directions.WEST),
     ([-0.725,  1.9],  TurtleBot4Directions.SOUTH),
     ([-2.2,   2.25],  TurtleBot4Directions.EAST),
     ([-2.15, -0.3],   TurtleBot4Directions.EAST),
@@ -52,7 +53,6 @@ WAYPOINTS = [
     ([ 2.1,  -4.0],   TurtleBot4Directions.WEST),
     ([ 1.97, -2.5],   TurtleBot4Directions.SOUTH),
     ([-1.5,  -2.2],   TurtleBot4Directions.WEST),
-    ([-0.725, -0.2],  TurtleBot4Directions.WEST),
 ]
 
 ZONES = [
@@ -90,7 +90,6 @@ ZONES = [
 
 PATROL_ORDER = [0, 1, 2, 3, 4, 5, 6, 7, 8]
 PATROL_LENGTH = len(PATROL_ORDER)
-FINAL_WAYPOINT_INDEX = 0
 
 # ── robot2 (AMR 2번) 기준 ──────────────────────────
 INITIAL_POSITION = [0.1424, 1.769]  
@@ -402,7 +401,7 @@ def patrol_cycle(node: AMR2Node, is_first_cycle: bool = False):
     navigator.info('순찰 시작!')
 
     current_mode = MODE_PATROL
-    patrol_pos = 0
+    patrol_pos = 1
 
     target_zone_id = None
     target_zone_first_index = None
