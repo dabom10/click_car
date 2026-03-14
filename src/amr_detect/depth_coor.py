@@ -686,13 +686,16 @@ class ParkingDetectionNode(Node):
     def _detect_cars(self, frame: np.ndarray) -> list:
         results = self.model.predict(
             source=frame, imgsz=YOLO_IMG_SIZE,
-            conf=CONF_THRESHOLD, verbose=False)
+            conf=CONF_THRESHOLD,
+            iou=0.45,          # NMS IoU 임계값: 겹치는 bbox 제거
+            agnostic_nms=True, # 클래스 무관 NMS (단일 클래스라 동일하나 명시)
+            verbose=False)
         cars = []
         if not results:
             return cars
 
         h_frame = frame.shape[0]
-        roi_top_px = int(h_frame * ROI_TOP_RATIO)  # 상단 제외 픽셀 경계선
+        roi_top_px = int(h_frame * ROI_TOP_RATIO)
 
         for box in results[0].boxes:
             cls_id = int(box.cls[0].item())
@@ -702,8 +705,6 @@ class ParkingDetectionNode(Node):
             x1, y1, x2, y2 = map(int, box.xyxy[0].cpu().numpy())
 
             # ── 상단 ROI 필터 ──
-            # bbox 하단(y2)이 roi_top_px보다 위에 있으면 제거
-            # bbox 중심이 아닌 하단 기준: 차량 하단이 ROI 경계 아래 있어야 유효
             if y2 <= roi_top_px:
                 self._save_hard_negative(frame, x1, y1, x2, y2,
                                          reason="roi_top")
@@ -715,8 +716,38 @@ class ParkingDetectionNode(Node):
                 "x1": x1, "y1": y1, "x2": x2, "y2": y2,
                 "area": max(1, (x2 - x1) * (y2 - y1)),
             })
+
+        # ── 후처리 NMS ──
+        # ROI 필터 후에도 겹치는 박스가 있으면 conf 높은 것만 남김
+        cars = self._nms(cars, iou_thresh=0.45)
         cars.sort(key=lambda d: (d["x1"] + d["x2"]) // 2)
         return cars
+
+    @staticmethod
+    def _nms(dets: list, iou_thresh: float = 0.45) -> list:
+        """
+        conf 내림차순 정렬 후 IoU 기반 greedy NMS.
+        YOLO 내장 NMS가 처리하지 못한 중복 박스 제거용.
+        """
+        if len(dets) <= 1:
+            return dets
+
+        dets_sorted = sorted(dets, key=lambda d: d["conf"], reverse=True)
+        keep = []
+        while dets_sorted:
+            best = dets_sorted.pop(0)
+            keep.append(best)
+            remaining = []
+            for d in dets_sorted:
+                ix = max(0, min(best["x2"], d["x2"]) - max(best["x1"], d["x1"]))
+                iy = max(0, min(best["y2"], d["y2"]) - max(best["y1"], d["y1"]))
+                inter = ix * iy
+                union = best["area"] + d["area"] - inter
+                iou   = inter / max(1, union)
+                if iou < iou_thresh:
+                    remaining.append(d)
+            dets_sorted = remaining
+        return keep
 
     # ── Depth ROI 샘플링 ─────────────────────────────────
     def _get_depth_mm_from_bbox_roi(
@@ -838,11 +869,10 @@ class ParkingDetectionNode(Node):
         if now - self.last_publish_time < PUBLISH_INTERVAL:
             return
 
-        parts, published = [], 0
+        published = 0
 
         for idx, (trk_det, smoothed) in enumerate(smoothed_targets, 1):
             if smoothed is None:
-                parts.append(f"car{idx}=NO_DEPTH")
                 continue
 
             # 대응 트랙 찾기
@@ -850,29 +880,27 @@ class ParkingDetectionNode(Node):
 
             # Warm-up 중인 트랙은 발행 억제
             if trk is not None and len(trk.history) < MIN_HISTORY_TO_PUBLISH:
-                parts.append(
-                    f"car{idx}=WARMUP"
-                    f"({len(trk.history)}/{MIN_HISTORY_TO_PUBLISH})")
                 continue
 
             x, y, z, _, _ = smoothed
-            std_str = trk.std_xyz if trk else "N/A"
+
+            # ── 탐지 좌표 로그 (항상 출력) ──
+            self.get_logger().info(
+                f"[DET] car{idx} → x={x:.3f}, y={y:.3f}")
 
             # ── 불법주정차 구역 체크 ──
-            # 구역 밖 차량은 탐지는 유지하되 publish 하지 않음
             if not self._in_illegal_zone(x, y):
-                parts.append(f"car{idx}=OUT_OF_ZONE ({x:.3f},{y:.3f})")
                 continue
 
+            # ── 구역 내 차량: 노란색(WARN) 로그 + publish ──
+            self.get_logger().warn(
+                f"\033[33m[PUB] car{idx} IN_ZONE → x={x:.3f}, y={y:.3f}\033[0m")
+
             msg = String()
-            msg.data = f"{x:.3f},{y:.3f},{z:.3f}"
+            msg.data = f"{x:.3f},{y:.3f}"
             self.amr_target_pub.publish(msg)
             published += 1
-            parts.append(f"car{idx}=({x:.3f},{y:.3f},{z:.3f}) {std_str} [IN_ZONE]")
 
-        self.get_logger().info(
-            f"[PUB] n={len(smoothed_targets)} pub={published} | "
-            + " | ".join(parts))
         self.last_publish_time = now
 
     # ── 회전 중 화면 표시 ────────────────────────────────
