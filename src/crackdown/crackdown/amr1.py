@@ -83,12 +83,12 @@ ZONES = [
         "zone_id": 1,
         "waypoint_indices": [0, 1],
         "corner1": ( 0.38,  2.55),
-        "corner2": (-1.67, -1.37),
+        "corner2": (-1.37, -1.37),
     },
     {
         "zone_id": 2,
         "waypoint_indices": [2, 3],
-        "corner1": (-1.67,  2.55),
+        "corner1": (-1.37,  2.55),
         "corner2": (-2.91, -1.37),
     },
     {
