@@ -264,10 +264,10 @@ def do_enforcement(navigator, node, target_x, target_y, source):
         node.capture_done = False
 
     if source == SOURCE_CCTV:
-        node.cap_start_pub.publish(String(data='cctv'))
+        node.cap_start_pub.publish(String(data='cctv_start'))
         navigator.info('[단속/CCTV] cctv_start(True) pub → capture_done 대기')
     else:
-        node.cap_start_pub.publish(String(data='amr'))
+        node.cap_start_pub.publish(String(data='amr_start'))
         navigator.info('[단속/AMR] amr_start(True) pub → capture_done 대기')
 
     # capture_done True 수신까지 대기
@@ -357,7 +357,7 @@ class AMRNode(Node):
         )
 
         # ── 발행 ─────────────────────────────────────
-        self.cap_start_pub = self.create_publisher(String, f'/{robot_ns}/cap_start', 10)        
+        self.cap_start_pub = self.create_publisher(String, f'/{robot_ns}/start', 10)        
         # self.cctv_start_pub = self.create_publisher(Bool, f'/{robot_ns}/cctv_start', 10)
         # self.amr_start_pub  = self.create_publisher(Bool, f'/{robot_ns}/amr_start',  10)
         # ── 상태 퍼블리셔 ──────────────────────────────
@@ -478,7 +478,7 @@ def patrol_cycle(node: AMRNode, is_first_cycle: bool = False):
         node.stop_requested = False
         node.battery_low    = False
         node.capture_done   = False
-        
+
         node.goto_requested = False
         node.target_x       = None
         node.target_y       = None
