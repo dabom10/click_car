@@ -5,8 +5,8 @@ model = YOLO("yolo26n.pt")  # n → s → m → l → x 순으로 무거워짐
 
 # 학습
 results = model.train(
-    data="/home/rokey/click_car/models/webcam/dataset/argu_no/data.yaml",
-    
+    data="/home/rokey/click_car/models/AMR/dataset/plus_dataset/AMRCARDETECT.v3-new_dataset.yolov8/data.yaml",
+            
     # ── 기본 설정 ──────────────────────────
     epochs=100,
     imgsz=640,
@@ -14,7 +14,7 @@ results = model.train(
     workers=4,
     device=0,            # GPU 없으면 device="cpu"
     project="/home/rokey/click_car/models/webcam",
-    name="v3",
+    name="v6",
     
     # ── Optimizer ──────────────────────────
     optimizer="Adam",     # SGD / Adam / AdamW
