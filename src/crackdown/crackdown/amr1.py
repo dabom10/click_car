@@ -478,6 +478,11 @@ def patrol_cycle(node: AMRNode, is_first_cycle: bool = False):
         node.stop_requested = False
         node.battery_low    = False
         node.capture_done   = False
+        
+        node.goto_requested = False
+        node.target_x       = None
+        node.target_y       = None
+        node.goto_source    = None        
 
     node.set_status(STATUS_CHARGING)
 
