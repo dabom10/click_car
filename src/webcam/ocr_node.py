@@ -387,7 +387,7 @@ class ParkingDetectionNode(Node):
         메시지에 좌표 등 추가 정보가 붙어 있어도 첫 번째 토큰(모드)만 사용한다.
         ocr_node 는 이미 현장에 도착해 있으므로 좌표는 불필요하다.
 
-        동일 모드 중복 수신 시 무시. 모드 전환 시 기존 추적 목록을 초기화한다.
+        새 start 신호 수신 시 기존 추적 목록을 초기화하고 항상 새 작업을 시작한다.
         '''
         raw = msg.data.strip()
 
@@ -408,10 +408,9 @@ class ParkingDetectionNode(Node):
         # ── 해당 로봇의 카메라·퍼블리셔 활성화 ──────────────────────────────
         self._activate_robot(ns)
 
-        if self.mode == cmd:   # 동일 모드 중복 수신 → 무시
-            return
-
-        # 모드 전환: 기존 추적 초기화 및 진행 중인 알림음 스레드 정리
+        # 동일 모드라도 새 start 신호는 항상 새 작업으로 처리한다.
+        # (예: cctv_start 가 연속으로 오면 각각 독립된 단속으로 진행)
+        # 기존 추적 목록을 초기화해 이전 차량과 섞이지 않도록 한다.
         self.mode             = cmd
         self.tracked_vehicles = []
         self._audio_stop_event.set()
