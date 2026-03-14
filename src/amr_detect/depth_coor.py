@@ -33,6 +33,7 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 from sensor_msgs.msg import CompressedImage, CameraInfo
 from std_msgs.msg import String
 from nav_msgs.msg import Odometry
+from tf2_ros import Buffer, TransformListener, LookupException, ConnectivityException, ExtrapolationException
 from ultralytics import YOLO
 
 
@@ -80,6 +81,22 @@ MAX_DEPTH_AGE_SEC = 0.15
 # 카메라 뷰 상단 30%는 car가 절대 나올 수 없는 영역 (천장/배경)
 # → 해당 영역에 bbox 중심이 있으면 오탐으로 간주하고 무시
 ROI_TOP_RATIO = 0.30   # 0.0~1.0, 상단 몇 % 를 제외할지
+
+# ── 회전 억제 ──────────────────────────────────
+# angular.z 실측 분석 결과:
+#   직진/정지 노이즈: 최대 0.041 rad/s
+#   실제 회전 구간:   0.10 rad/s 이상
+# TurtleBot4 odom은 wheel encoder 기반으로 순간값이 노이즈성으로 튀는 경우 있음
+# → 이동 평균(ANGULAR_AVG_WINDOW 프레임)으로 안정화 후 임계값 비교
+ROTATE_SUPPRESS_THRESH = 0.10   # rad/s (평균값 기준)
+ANGULAR_AVG_WINDOW     = 5      # 평균 낼 프레임 수 (odom ~50Hz → 약 0.1초)
+
+# ── Hard Negative 자동 저장 ───────────────────
+# ROI 필터에 걸린 오탐 프레임을 원본 이미지로 저장
+# → 나중에 라벨링 후 재학습 데이터로 활용
+HARD_NEG_SAVE       = True    # False로 바꾸면 저장 안 함
+HARD_NEG_SAVE_DIR   = "/home/rokey/click_car/hard_negatives"
+HARD_NEG_INTERVAL   = 3.0     # 같은 오탐이 연속으로 저장되는 것 방지 (초)
 
 # ── EKF 파라미터 ──────────────────────────────
 # 프로세스 노이즈 Q: 정지 모델용 (매우 작게)
@@ -313,9 +330,25 @@ class ParkingDetectionNode(Node):
 
         # ── odom: AMR 현재 위치/방향 (world frame 변환용) ──
         # odom이 없으면 카메라 상대 좌표 그대로 publish (fallback)
-        self._odom_x   = None   # AMR x (m)
-        self._odom_y   = None   # AMR y (m)
-        self._odom_yaw = None   # AMR yaw (rad)
+        self._odom_x         = None   # AMR x (m)
+        self._odom_y         = None   # AMR y (m)
+        self._odom_yaw       = None   # AMR yaw (rad)
+        self._odom_angular_z = 0.0    # AMR 회전 각속도 이동 평균 (rad/s)
+        self._angular_z_buf  = deque(maxlen=ANGULAR_AVG_WINDOW)  # 이동 평균 버퍼
+
+        # ── TF2: odom → map 좌표 변환용 ──
+        # SLAM localization 실행 중이면 map→odom TF가 발행됨
+        # TF 없을 때(localization 미실행)는 odom 좌표 그대로 fallback
+        self._tf_buffer   = Buffer()
+        self._tf_listener = TransformListener(self._tf_buffer, self)
+
+        # ── Hard Negative 저장 초기화 ──
+        self._last_hard_neg_time = 0.0
+        self._latest_raw_frame   = None   # S키 저장용 원본 프레임
+        if HARD_NEG_SAVE:
+            import os
+            os.makedirs(HARD_NEG_SAVE_DIR, exist_ok=True)
+            self.get_logger().info(f"[HardNeg] 저장 경로: {HARD_NEG_SAVE_DIR}")
 
         self._load_model()
         self._init_subscriber()
@@ -407,9 +440,16 @@ class ParkingDetectionNode(Node):
         self._odom_x = msg.pose.pose.position.x
         self._odom_y = msg.pose.pose.position.y
 
+        # ── angular.z 이동 평균 ──
+        # TurtleBot4 wheel encoder odom은 순간값이 노이즈성으로 튀는 경우가 있음.
+        # 순간값 그대로 쓰면 실제로 조금만 회전해도 임계값을 넘어 차단될 수 있음.
+        # → 최근 N프레임 평균으로 안정화
+        raw_angular_z = msg.twist.twist.angular.z
+        self._angular_z_buf.append(raw_angular_z)
+        self._odom_angular_z = float(np.mean(self._angular_z_buf))
+
         # quaternion → yaw
         q = msg.pose.pose.orientation
-        # yaw = atan2(2(wz + xy), 1 - 2(yy + zz))
         siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
         cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
         self._odom_yaw = float(np.arctan2(siny_cosp, cosy_cosp))
@@ -451,6 +491,50 @@ class ParkingDetectionNode(Node):
         world_z = base_z   # 높이는 회전 불필요
 
         return (world_x, world_y, world_z)
+
+    def _odom_to_map(self, ox: float, oy: float, oz: float):
+        """
+        odom 좌표 → map 좌표 변환 (TF2 사용).
+
+        SLAM localization 실행 중이면 map→odom TF가 발행되므로
+        이를 역으로 적용해 odom 좌표를 map 좌표로 변환.
+
+        TF 없을 때(localization 미실행):
+          → None 반환 → 호출부에서 odom 좌표 그대로 fallback
+        """
+        try:
+            # map→odom TF를 가져와서 odom→map 방향으로 적용
+            t = self._tf_buffer.lookup_transform(
+                "map", "odom",
+                rclpy.time.Time(),          # 최신 TF
+                timeout=rclpy.duration.Duration(seconds=0.05))
+
+            # TF에서 translation + quaternion 추출
+            tx = t.transform.translation.x
+            ty = t.transform.translation.y
+            tz = t.transform.translation.z
+            qx = t.transform.rotation.x
+            qy = t.transform.rotation.y
+            qz = t.transform.rotation.z
+            qw = t.transform.rotation.w
+
+            # quaternion → yaw (2D 변환, roll/pitch 무시)
+            siny = 2.0 * (qw * qz + qx * qy)
+            cosy = 1.0 - 2.0 * (qy * qy + qz * qz)
+            yaw  = float(np.arctan2(siny, cosy))
+
+            # odom → map: 회전 후 translation 더하기
+            cos_y = np.cos(yaw)
+            sin_y = np.sin(yaw)
+            map_x = tx + ox * cos_y - oy * sin_y
+            map_y = ty + ox * sin_y + oy * cos_y
+            map_z = tz + oz
+
+            return (map_x, map_y, map_z)
+
+        except (LookupException, ConnectivityException, ExtrapolationException):
+            # TF 없음 → localization 미실행 상태
+            return None
 
 
     def _decode_compressed_depth(self, msg: CompressedImage):
@@ -495,6 +579,18 @@ class ParkingDetectionNode(Node):
         if frame is None:
             return
 
+        # 원본 프레임 보존 — S키 저장 시 bbox 없는 이미지를 내보내기 위함
+        self._latest_raw_frame = frame.copy()
+
+        # ── 회전 억제 ──────────────────────────────────
+        # 회전 중에는 모션 블러로 FP 폭발 → 탐지 자체를 스킵
+        if abs(self._odom_angular_z) > ROTATE_SUPPRESS_THRESH:
+            self.get_logger().info(
+                f"[ROT] 회전 중 탐지 억제 (angular_z={self._odom_angular_z:.3f})",
+                throttle_duration_sec=1.0)
+            self._draw_rotating(frame)
+            return
+
         car_dets = self._detect_cars(frame)
 
         # Depth 스냅샷 — 나이 체크 포함
@@ -519,6 +615,52 @@ class ParkingDetectionNode(Node):
         self._publish_targets(smoothed)
         self._draw(frame, smoothed)
 
+    # ── Hard Negative 저장 ───────────────────────────
+    def _save_hard_negative_manual(self):
+        """
+        S키 입력 시 호출 — 현재 원본 프레임(bbox 없음)을 저장.
+        화면에는 bbox가 그려지지만 저장되는 이미지는 원본 그대로.
+        """
+        if not HARD_NEG_SAVE:
+            self.get_logger().warn("[HardNeg] HARD_NEG_SAVE=False, 저장 비활성화 상태")
+            return
+        if self._latest_raw_frame is None:
+            return
+        import os
+        ts    = int(time.time() * 1000)
+        fname = f"hn_{ts}_manual.jpg"
+        fpath = os.path.join(HARD_NEG_SAVE_DIR, fname)
+        cv2.imwrite(fpath, self._latest_raw_frame)
+        self.get_logger().info(f"[HardNeg] S키 저장: {fname}")
+
+    def _save_hard_negative(self, frame: np.ndarray,
+                            x1: int, y1: int, x2: int, y2: int,
+                            reason: str = ""):
+        """
+        오탐으로 판단된 프레임을 bbox 없는 원본으로 저장.
+
+        저장 파일명: hn_<타임스탬프>_<reason>.jpg
+        - 연속 저장 방지: HARD_NEG_INTERVAL 초 이내 재저장 안 함
+        - 저장되는 이미지: bbox/텍스트 없는 원본 프레임
+          → Roboflow 등에서 바로 라벨링 가능
+        """
+        if not HARD_NEG_SAVE:
+            return
+        now = time.monotonic()
+        if now - self._last_hard_neg_time < HARD_NEG_INTERVAL:
+            return   # 너무 자주 저장 방지
+
+        import os
+        ts = int(time.time() * 1000)   # ms 타임스탬프
+        fname = f"hn_{ts}_{reason}.jpg"
+        fpath = os.path.join(HARD_NEG_SAVE_DIR, fname)
+
+        # 원본 프레임 저장 (bbox 없음)
+        cv2.imwrite(fpath, frame)
+        self._last_hard_neg_time = now
+        self.get_logger().info(
+            f"[HardNeg] 저장: {fname}  bbox=({x1},{y1},{x2},{y2})")
+
     # ── YOLO 탐지 ────────────────────────────────────────
     def _detect_cars(self, frame: np.ndarray) -> list:
         results = self.model.predict(
@@ -542,6 +684,8 @@ class ParkingDetectionNode(Node):
             # bbox 하단(y2)이 roi_top_px보다 위에 있으면 제거
             # bbox 중심이 아닌 하단 기준: 차량 하단이 ROI 경계 아래 있어야 유효
             if y2 <= roi_top_px:
+                self._save_hard_negative(frame, x1, y1, x2, y2,
+                                         reason="roi_top")
                 continue
 
             cars.append({
@@ -592,17 +736,24 @@ class ParkingDetectionNode(Node):
         cam_x = (u - self.camera_info["cx"]) * cam_z / self.camera_info["fx"]
         cam_y = (v - self.camera_info["cy"]) * cam_z / self.camera_info["fy"]
 
-        # ── world frame 변환 시도 ──
-        world = self._camera_to_world(cam_x, cam_y, cam_z)
-
-        if world is not None:
-            # odom 수신 중 → world 좌표 사용
-            return (world[0], world[1], world[2], u, v)
-        else:
-            # odom 미수신 → 카메라 상대 좌표 fallback (로그 경고)
+        # ── camera → odom 좌표 변환 ──
+        odom_xyz = self._camera_to_world(cam_x, cam_y, cam_z)
+        if odom_xyz is None:
             self.get_logger().warn("[ODOM] Not received yet, using camera-relative coords.",
                                    throttle_duration_sec=5.0)
             return (cam_x, cam_y, cam_z, u, v)
+
+        # ── odom → map 좌표 변환 (TF2) ──
+        # SLAM localization 실행 중이면 map 좌표로 변환
+        # localization 미실행 시 odom 좌표 그대로 fallback
+        map_xyz = self._odom_to_map(odom_xyz[0], odom_xyz[1], odom_xyz[2])
+        if map_xyz is not None:
+            return (map_xyz[0], map_xyz[1], map_xyz[2], u, v)
+        else:
+            # TF 없음 → odom 좌표 그대로 사용 (fallback)
+            self.get_logger().warn("[TF] map→odom TF 없음, odom 좌표 사용 (localization 실행 필요)",
+                                   throttle_duration_sec=5.0)
+            return (odom_xyz[0], odom_xyz[1], odom_xyz[2], u, v)
 
     # ── IoU 트래킹 ───────────────────────────────────────
     @staticmethod
@@ -673,6 +824,19 @@ class ParkingDetectionNode(Node):
             + " | ".join(parts))
         self.last_publish_time = now
 
+    # ── 회전 중 화면 표시 ────────────────────────────────
+    def _draw_rotating(self, frame: np.ndarray):
+        """회전 억제 중임을 화면에 표시 (탐지 결과 없음)"""
+        if not self.gui_enabled:
+            return
+        overlay = frame.copy()
+        cv2.putText(overlay, f"ROTATING — detection suppressed",
+                    (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2)
+        cv2.putText(overlay, f"angular_z={self._odom_angular_z:.3f} rad/s",
+                    (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 165, 255), 1)
+        cv2.imshow(WINDOW_NAME, overlay)
+        cv2.waitKey(1)
+
     # ── 시각화 ───────────────────────────────────────────
     def _draw(self, frame: np.ndarray, smoothed_targets: list):
         if not self.gui_enabled:
@@ -716,8 +880,14 @@ class ParkingDetectionNode(Node):
 
         cv2.putText(frame, f"Cars: {len(smoothed_targets)}  [EKF]",
                     (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
+        cv2.putText(frame, "S: save hard-neg",
+                    (10, frame.shape[0] - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (180, 180, 180), 1)
         cv2.imshow(WINDOW_NAME, frame)
-        cv2.waitKey(1)
+
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('s') or key == ord('S'):
+            self._save_hard_negative_manual()
 
     # ── 종료 ─────────────────────────────────────────────
     def destroy_node(self):
