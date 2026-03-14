@@ -48,7 +48,7 @@ YOLO_IMG_SIZE    = 704
 TOPIC_RGB        = f"{ROBOT_NAMESPACE}/oakd/rgb/image_raw/compressed"
 TOPIC_DEPTH      = f"{ROBOT_NAMESPACE}/oakd/stereo/image_raw/compressedDepth"
 TOPIC_INFO       = f"{ROBOT_NAMESPACE}/oakd/rgb/camera_info"
-TOPIC_AMR_TARGET = f"{ROBOT_NAMESPACE}/amr_done"
+TOPIC_AMR_TARGET = f"{ROBOT_NAMESPACE}amr_done"
 TOPIC_ODOM       = f"{ROBOT_NAMESPACE}/odom"   # world frame 변환용
 
 # ── 카메라 → 로봇 베이스 오프셋 (단위: m) ──────────────
