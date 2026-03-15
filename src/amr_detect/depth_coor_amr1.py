@@ -24,7 +24,7 @@ from ultralytics import YOLO
 # ──────────────────────────────────────────
 # 설정값
 # ──────────────────────────────────────────
-ROBOT_NAMESPACE  = "/robot2"
+ROBOT_NAMESPACE  = "/robot3"
 MODEL_PATH       = "/home/rokey/click_car/models/amr.pt"
 
 CONF_THRESHOLD   = 0.70
@@ -41,7 +41,7 @@ CAM_OFFSET_X = -0.10
 CAM_OFFSET_Y =  0.00
 CAM_OFFSET_Z =  0.25
 
-WINDOW_NAME      = "Parking Detection - AMR2(robot2)"
+WINDOW_NAME      = "Parking Detection - AMR1(robot3)"
 PUBLISH_INTERVAL = 0.2
 
 # 트래킹
