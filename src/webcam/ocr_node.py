@@ -15,24 +15,26 @@
 5. 검증     : 번호판이 차량 영역 내부에 있는지 Overlap 비율로 검증
 6. 추적     : IoU 기반 동일 차량 식별 + 모드별 타이머 관리
 7. 업로드   : Firebase Realtime DB에 케이스별 누적 저장
-               - initial  : 최초 감지 시 전체 프레임 저장, status="watching"
-               - confirmed: 타이머 초과 시 증거 프레임 + 번호판 크롭 + OCR 결과 기록
+               - amr_start 모드: confirmed 시에만 업로드 (로컬 임시 저장 → confirmed 후 일괄 업로드)
+                 미확정 시 로컬 파일 자동 삭제
+               - cctv_start 모드: confirmed 시 cctv_detections 경로에만 업로드
 8. 알림음   : amr_start 모드에서 타이머 동작 중
                "Santa Claus is Coming to Town" 멜로디를 AudioNoteVector 토픽으로 퍼블리시
 
 [Firebase 데이터 구조]
   detections/<YYYYMMDD_HHMMSSffffff>/
-    ├── status          "watching" | "confirmed"
-    ├── detected_at     최초 감지 ISO 시각
-    ├── confirmed_at    확정 ISO 시각 (confirmed 시에만 채워짐)
-    ├── initial_image   최초 감지 전체 프레임 JPEG → base64
+    ├── status          "confirmed" (confirmed 시에만 생성됨)
+    ├── detected_at     최초 감지 ISO 시각 (case_key에서 복원)
+    ├── confirmed_at    확정 ISO 시각
+    ├── initial_image   최초 감지 전체 프레임 JPEG → base64 (로컬 임시파일에서 복원)
     ├── evidence_image  확정 시 전체 프레임 JPEG → base64
-    ├── plate_image     확정 시 번호판 크롭 JPEG → base64  ← confirmed 시에만 기록
-    └── plate_number    OCR 인식 결과                      ← confirmed 시에만 기록
+    ├── plate_image     확정 시 번호판 크롭 JPEG → base64
+    └── plate_number    OCR 인식 결과
 '''
 
 import base64        # 이미지를 Firebase에 저장하기 위한 base64 인코딩
 import datetime      # 감지 시각을 ISO 문자열로 기록
+import os            # 로컬 임시 파일 저장/삭제
 import queue         # 메인 루프와 업로드 워커 간 스레드 안전 데이터 전달
 import threading     # OCR·업로드를 메인 루프와 분리하기 위한 스레드
 import time          # 단속 타이머 계산용 (monotonic clock)
@@ -87,6 +89,15 @@ TOPIC_CMD_ROBOT3  = "/robot3/start"
 FIREBASE_CCTV_DB_PATH = "cctv_detections"   # webcam_detector 가 생성한 케이스에 AMR 증거를 추가하는 경로
 
 GOOGLE_VISION_CRED_PATH = "/home/rokey/Downloads/google_vision.json"  # GCV 서비스 계정 키 경로
+
+# ── 로컬 임시 저장 (amr_start 전용) ──────────────────────────────────────────
+# confirmed 전까지 이미지를 로컬에만 보관하다가, confirmed 시에 한 번에 Firebase 업로드.
+# confirmed 없이 노드가 종료되거나 새 start 신호가 오면 자동 삭제.
+LOCAL_TEMP_DIR        = "/tmp/click_car_amr"   # 임시 저장 디렉토리
+
+# ── capture_done 재전송 횟수 ──────────────────────────────────────────────────
+CAPTURE_DONE_REPEAT   = 5     # capture_done 을 몇 번 반복 발행할지
+CAPTURE_DONE_INTERVAL = 0.2   # 반복 발행 간격 (초)
 
 # ──────────────────────────────────────────────
 # [CHAPTER 2-B: 캐논 변주곡 D장조 하이라이트 멜로디]
@@ -216,6 +227,9 @@ class ParkingDetectionNode(Node):
         self.mode              = None   # 현재 동작 모드: "amr_start" | "cctv_start" | None(대기)
         self.parking_timeout   = None   # 현재 모드의 단속 타이머 값(초)
         self._audio_stop_event = threading.Event()  # 알림음 스레드 종료 신호용 이벤트
+        self._local_case_key   = None   # amr_start 로컬 임시 저장 케이스 키 (confirmed 전까지 보관)
+        self._pending_ns       = None   # 타이머에서 처리할 로봇 네임스페이스 대기열
+        self._deactivate_cam   = False  # 타이머에서 카메라 구독 해제 요청 플래그
 
         # ── 동적 퍼블리셔·구독자 (네임스페이스 확정 후 생성) ──
         self.audio_pub        = None   # /robotN/cmd_audio        — cmd_callback 에서 생성
@@ -229,8 +243,18 @@ class ParkingDetectionNode(Node):
         self._init_gcv()          # Google Cloud Vision 초기화 (1순위)
         self._init_cmd_subscribers()  # /robot2/start + /robot3/start 구독
 
+        # ── 로봇 활성화 타이머 (10Hz) ──
+        # create_subscription / destroy_subscription 을 콜백 안에서 직접 호출하면
+        # executor 의 wait set 재구성과 충돌할 수 있다.
+        # cmd_callback 은 _pending_ns 플래그만 세팅하고,
+        # 실제 구독 생성·해제는 이 타이머 콜백에서 spin 루프와 동일 컨텍스트로 처리한다.
+        self.create_timer(0.1, self._activation_timer)
+
         # 업로드·OCR 전담 데몬 스레드 시작 (메인 루프 블로킹 방지)
         threading.Thread(target=self._upload_worker, daemon=True).start()
+
+        # 로컬 임시 저장 디렉토리 생성
+        os.makedirs(LOCAL_TEMP_DIR, exist_ok=True)
 
         cv2.namedWindow("Plate Checking", cv2.WINDOW_NORMAL)
         cv2.resizeWindow("Plate Checking", YOLO_IMG_SIZE, YOLO_IMG_SIZE)
@@ -324,15 +348,42 @@ class ParkingDetectionNode(Node):
 
     def _activate_robot(self, ns: str):
         '''
-        명령을 보낸 로봇의 네임스페이스(ns)로 카메라 구독·퍼블리셔를 (재)생성한다.
-        같은 로봇에서 반복 명령이 오면 재생성하지 않는다.
-        다른 로봇으로 전환되면 기존 구독을 해제하고 새로 만든다.
+        cmd_callback 에서 호출되는 경량 래퍼.
+        실제 구독 생성·해제는 executor 와 동일 컨텍스트인 _activation_timer 에서 수행한다.
+        콜백 안에서 create_subscription / destroy_subscription 을 직접 호출하면
+        executor 의 wait set 재구성과 충돌할 수 있으므로 플래그만 세팅한다.
         '''
-        if self.ns == ns:   # 이미 같은 로봇 활성 중 → 스킵
+        self._pending_ns = ns
+        self.get_logger().info(f"[activate] 대기열 등록: ns={ns}")
+
+    def _activation_timer(self):
+        '''
+        10Hz 타이머 콜백. _pending_ns 가 세팅돼 있으면 카메라 구독·퍼블리셔를 (재)생성한다.
+        spin 루프와 동일 스레드에서 실행되므로 wait set 재구성이 안전하다.
+
+        같은 로봇 네임스페이스가 이미 활성화돼 있으면 스킵한다.
+        다른 로봇으로 전환 시 기존 구독을 먼저 해제한 뒤 새로 생성한다.
+        '''
+        # ── 카메라 구독 해제 요청 처리 (confirmed 후 image_callback 에서 세팅) ──
+        if self._deactivate_cam:
+            self._deactivate_cam = False
+            if self._cam_sub is not None:
+                self.destroy_subscription(self._cam_sub)
+                self._cam_sub = None
+                self.get_logger().info("[activation_timer] 카메라 구독 해제 완료 — 대기 중")
+            return   # 이번 틱은 해제만 처리, pending_ns 는 다음 틱에서 처리
+
+        if self._pending_ns is None:
             return
 
-        self.ns = ns
-        topic_rgb  = f"{ns}/oakd/rgb/image_raw/compressed"
+        ns = self._pending_ns
+        self._pending_ns = None   # 처리 시작 — 중복 실행 방지
+
+        if self.ns == ns and self._cam_sub is not None:
+            self.get_logger().info(f"[activation_timer] {ns} 이미 활성 — 스킵")
+            return
+
+        topic_rgb   = f"{ns}/oakd/rgb/image_raw/compressed"
         topic_audio = f"{ns}/cmd_audio"
         topic_done  = f"{ns}/capture_done"
 
@@ -340,6 +391,7 @@ class ParkingDetectionNode(Node):
         if self._cam_sub is not None:
             self.destroy_subscription(self._cam_sub)
             self._cam_sub = None
+            self.get_logger().info("[activation_timer] 기존 카메라 구독 해제")
 
         # ── 카메라 구독 (BEST_EFFORT — OAK-D 드라이버가 BEST_EFFORT로 퍼블리시) ──
         # 구독자가 RELIABLE이면 QoS 협상 실패로 연결 안 맺힘 → BEST_EFFORT 필수
@@ -356,8 +408,9 @@ class ParkingDetectionNode(Node):
         self.audio_pub        = self.create_publisher(AudioNoteVector, topic_audio, 10)
         self.capture_done_pub = self.create_publisher(Bool, topic_done, 10)
 
+        self.ns = ns
         self.get_logger().info(
-            f"[로봇 전환] ns={ns}\n"
+            f"[activation_timer] 활성화 완료 ns={ns}\n"
             f"  카메라 구독 : {topic_rgb}\n"
             f"  오디오 발행 : {topic_audio}\n"
             f"  완료 발행   : {topic_done}"
@@ -380,6 +433,7 @@ class ParkingDetectionNode(Node):
         새 start 신호 수신 시 기존 추적 목록을 초기화하고 항상 새 작업을 시작한다.
         '''
         raw = msg.data.strip()
+        self.get_logger().info(f"[cmd] 수신: '{raw}' from {ns}")   # ★ 수신 확인용 — 콜백 미호출 vs publish 실패 구분
 
         # ── 첫 번째 토큰만으로 모드를 결정한다 ──────────────────────────────
         token = raw.split(":")[0]
@@ -404,6 +458,9 @@ class ParkingDetectionNode(Node):
         self.mode             = cmd
         self.tracked_vehicles = []
         self._audio_stop_event.set()
+
+        # 새 start 신호가 오면 이전 amr_start 세션의 미확정 로컬 데이터 삭제
+        self._clear_local_temp()
 
         if cmd == "amr_start":
             self.parking_timeout = PARKING_TIMEOUT_AMR
@@ -434,6 +491,16 @@ class ParkingDetectionNode(Node):
         발행해 즉시 재생을 정지시킨다.
         '''
         if self._audio_stop_event.is_set():
+            return
+
+        # audio_pub 이 아직 _activation_timer 에서 생성되지 않았을 수 있으므로 잠시 대기
+        for _ in range(20):   # 최대 2초 대기 (0.1초 × 20)
+            if self.audio_pub is not None:
+                break
+            time.sleep(0.1)
+
+        if self.audio_pub is None:
+            self.get_logger().warn("[Audio] audio_pub 미생성 — 캐논 스킵")
             return
 
         self.get_logger().info("[Audio] 캐논 변주곡 시작 (단일 메시지 방식)")
@@ -631,20 +698,25 @@ class ParkingDetectionNode(Node):
                 self._enqueue(frame, track, event="confirmed")   # 30초 초과 시 확정 업로드
                 track.confirmed_uploaded = True                  # 이후 재업로드 방지
 
-                # ── 촬영 완료 신호 퍼블리시 ──────────────────────────────────
-                # confirmed 이벤트가 큐에 투입된 직후 capture_done = True 를 발행한다.
-                # 수신 측(네비게이션 등)은 이 신호를 받아 AMR 이동·다음 임무를 진행한다.
-                done_msg      = Bool()
-                done_msg.data = True
-                self.capture_done_pub.publish(done_msg)
-                self.get_logger().info("[capture_done] True 퍼블리시")
+                # ── 촬영 완료 신호 퍼블리시 (CAPTURE_DONE_REPEAT 회 반복) ────────
+                # 네트워크 불안정 대비: 0.2초 간격으로 5회 반복 발행한다.
+                # 별도 데몬 스레드에서 실행해 image_callback 블로킹을 방지한다.
+                threading.Thread(
+                    target=self._publish_capture_done_repeated,
+                    daemon=True
+                ).start()
+                self.get_logger().info(
+                    f"[capture_done] True × {CAPTURE_DONE_REPEAT}회 발송 시작"
+                )
 
-                # ── 카메라 구독 해제: 다음 start 신호 전까지 영상 처리 중단 ──
-                if self._cam_sub is not None:
-                    self.destroy_subscription(self._cam_sub)
-                    self._cam_sub = None
-                    self.mode = None
-                    self.get_logger().info("[cam_sub] 구독 해제 — 대기 중")
+                # ── 카메라 구독 해제 요청 ─────────────────────────────────────
+                # image_callback 은 spin 루프의 콜백 컨텍스트이므로
+                # 여기서 destroy_subscription 을 직접 호출하면 wait set 충돌 위험.
+                # 플래그만 세팅하고 _activation_timer 에서 안전하게 처리한다.
+                self._deactivate_cam = True
+                self.mode = None
+                self.ns   = None
+                self.get_logger().info("[cam_sub] 구독 해제 요청 → 타이머 대기")
 
             next_tracks.append(track)   # confirmed 여부 무관하게 추적 목록 유지
 
@@ -712,6 +784,42 @@ class ParkingDetectionNode(Node):
 
         cv2.imshow("Plate Checking", frame)
         cv2.waitKey(1)   # 1ms 대기 (GUI 이벤트 처리용, 프레임 블로킹 없음)
+
+    # ── capture_done 반복 발행 ───────────────────
+
+    def _publish_capture_done_repeated(self):
+        '''
+        capture_done = True 를 CAPTURE_DONE_REPEAT 회 반복 발행한다.
+        네트워크 패킷 손실 대비용. 별도 데몬 스레드에서 호출된다.
+        '''
+        for i in range(CAPTURE_DONE_REPEAT):
+            if self.capture_done_pub is None:
+                break
+            done_msg      = Bool()
+            done_msg.data = True
+            self.capture_done_pub.publish(done_msg)
+            self.get_logger().info(f"[capture_done] {i+1}/{CAPTURE_DONE_REPEAT}")
+            if i < CAPTURE_DONE_REPEAT - 1:
+                time.sleep(CAPTURE_DONE_INTERVAL)
+
+    # ── 로컬 임시 데이터 정리 ───────────────────
+
+    def _clear_local_temp(self):
+        '''
+        LOCAL_TEMP_DIR 에 남아 있는 현재 케이스의 미확정 임시 파일을 삭제한다.
+        새 start 신호 수신 시, 또는 노드 종료 시 호출된다.
+        '''
+        if self._local_case_key is None:
+            return
+        for suffix in ("_initial_frame.jpg", "_initial_plate.jpg"):
+            path = os.path.join(LOCAL_TEMP_DIR, self._local_case_key + suffix)
+            try:
+                if os.path.exists(path):
+                    os.remove(path)
+                    self.get_logger().info(f"[local] 임시 파일 삭제: {path}")
+            except Exception as e:
+                self.get_logger().warn(f"[local] 임시 파일 삭제 실패: {e}")
+        self._local_case_key = None
 
     # ── Firebase 업로드 및 OCR 워커 ─────────────
 
@@ -787,29 +895,41 @@ class ParkingDetectionNode(Node):
             return   # detections 에는 아무것도 쓰지 않음
 
         # ════════════════════════════════════════════════════════════════════
-        # [B] amr_start 모드: detections/<타임스탬프> 에 누적 저장
+        # [B] amr_start 모드: confirmed 시에만 Firebase 업로드
+        #     initial  → 로컬 임시 파일로만 저장 (Firebase 미사용)
+        #     confirmed → 로컬 파일 + 현재 프레임을 합쳐 Firebase에 한 번에 업로드
+        #                 업로드 완료 후 로컬 임시 파일 삭제
         # ════════════════════════════════════════════════════════════════════
         if event == "initial":
-            case_key = now_dt.strftime("%Y%m%d_%H%M%S_%f")
-            self.current_case_ref = self.db_ref.reference(
-                f"{FIREBASE_DB_PATH}/{case_key}"
-            )
-            self.current_case_ref.set({
-                "status":         "watching",
-                "detected_at":    now_iso,
-                "confirmed_at":   None,
-                "initial_image":  self._to_b64(frame),
-                "evidence_image": None,
-                "plate_image":    None,
-                "plate_number":   None,
-            })
-            self.get_logger().info(f"[initial]   key: {case_key}")
+            # ── 로컬 임시 저장만 수행, Firebase 미사용 ──
+            case_key             = now_dt.strftime("%Y%m%d_%H%M%S_%f")
+            self._local_case_key = case_key
+
+            frame_path = os.path.join(LOCAL_TEMP_DIR, case_key + "_initial_frame.jpg")
+            plate_path = os.path.join(LOCAL_TEMP_DIR, case_key + "_initial_plate.jpg")
+
+            try:
+                cv2.imwrite(frame_path, frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+                if plate_crop is not None and plate_crop.size > 0:
+                    cv2.imwrite(plate_path, plate_crop, [cv2.IMWRITE_JPEG_QUALITY, 95])
+                self.get_logger().info(f"[initial/local] 임시 저장 완료: {case_key}")
+            except Exception as e:
+                self.get_logger().error(f"[initial/local] 임시 저장 실패: {e}")
 
         elif event == "confirmed":
-            if self.current_case_ref is None:
-                self.get_logger().warn("[confirmed] current_case_ref 없음. 업로드 스킵.")
+            if self._local_case_key is None:
+                self.get_logger().warn("[confirmed] local_case_key 없음. 업로드 스킵.")
                 return
 
+            case_key   = self._local_case_key
+            frame_path = os.path.join(LOCAL_TEMP_DIR, case_key + "_initial_frame.jpg")
+            plate_path = os.path.join(LOCAL_TEMP_DIR, case_key + "_initial_plate.jpg")
+
+            # ── initial 프레임 로컬에서 복원 ──
+            initial_frame = cv2.imread(frame_path)
+            initial_plate = cv2.imread(plate_path) if os.path.exists(plate_path) else None
+
+            # ── OCR 수행 (confirmed 프레임의 번호판 크롭 사용) ──
             plate_number = "UNKNOWN"
             if plate_crop is not None:
                 if self.gcv_client is not None:
@@ -817,16 +937,34 @@ class ParkingDetectionNode(Node):
                 if plate_number == "UNKNOWN" and self.ocr_reader is not None:
                     plate_number = self._ocr_paddle(plate_crop)
 
-            self.current_case_ref.update({
+            # ── Firebase에 한 번에 업로드 ──
+            confirmed_at_iso = now_iso
+            detected_at_iso  = datetime.datetime.strptime(
+                case_key, "%Y%m%d_%H%M%S_%f"
+            ).isoformat()
+
+            case_ref = self.db_ref.reference(f"{FIREBASE_DB_PATH}/{case_key}")
+            case_ref.set({
                 "status":         "confirmed",
-                "confirmed_at":   now_iso,
+                "detected_at":    detected_at_iso,
+                "confirmed_at":   confirmed_at_iso,
+                "initial_image":  self._to_b64(initial_frame) if initial_frame is not None else None,
                 "evidence_image": self._to_b64(frame),
                 "plate_image":    self._to_b64(plate_crop) if plate_crop is not None else None,
                 "plate_number":   plate_number,
             })
             self.get_logger().info(
-                f"[confirmed] Plate: {plate_number}  at {now_dt.strftime('%H:%M:%S')}"
+                f"[confirmed] Plate: {plate_number}  key: {case_key}  at {now_dt.strftime('%H:%M:%S')}"
             )
+
+            # ── 로컬 임시 파일 삭제 ──
+            for path in (frame_path, plate_path):
+                try:
+                    if os.path.exists(path):
+                        os.remove(path)
+                except Exception as e:
+                    self.get_logger().warn(f"[confirmed] 임시 파일 삭제 실패: {e}")
+            self._local_case_key = None
 
 
     def _ocr_gcv(self, img: np.ndarray) -> str:
@@ -957,9 +1095,11 @@ class ParkingDetectionNode(Node):
         '''
         노드 종료 시 알림음 스레드와 업로드 워커 스레드를 안전하게 종료하고
         OpenCV GUI 자원을 해제한다.
+        미확정 로컬 임시 파일도 이 시점에 삭제한다.
         '''
         self._audio_stop_event.set()   # 알림음 스레드 종료 신호 (Santa 루프 즉시 탈출)
         self.save_queue.put(None)      # 업로드 워커 스레드 종료 신호 (Sentinel)
+        self._clear_local_temp()       # 미확정 로컬 임시 파일 삭제
         cv2.destroyAllWindows()        # 모든 OpenCV 창 닫기
         super().destroy_node()
 
