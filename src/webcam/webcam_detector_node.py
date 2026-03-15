@@ -76,7 +76,7 @@ CCTV_DB_PATH     = "cctv_detections"  # AMR 과 공유하는 CCTV 연동 증거 
 # 로컬 임시 이미지 저장 디렉토리 (confirmed 전까지 first_seen 프레임을 보관)
 TEMP_IMAGE_DIR   = "/tmp/click_car_cctv"
 
-ILLEGAL_PARK_SEC = 90.0    # 이 시간(초) 이상 연속 감지 시 불법주정차 확정 + cctv_done 퍼블리시
+ILLEGAL_PARK_SEC = 30.0    # 이 시간(초) 이상 연속 감지 시 불법주정차 확정 + cctv_done 퍼블리시
 
 # ── cctv_done 재전송 횟수 ─────────────────────────────────────────────────────
 CCTV_DONE_REPEAT   = 5     # cctv_done 을 몇 번 반복 발행할지
