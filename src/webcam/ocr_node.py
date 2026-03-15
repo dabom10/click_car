@@ -229,7 +229,6 @@ class ParkingDetectionNode(Node):
         self._audio_stop_event = threading.Event()  # 알림음 스레드 종료 신호용 이벤트
         self._local_case_key   = None   # amr_start 로컬 임시 저장 케이스 키 (confirmed 전까지 보관)
         self._pending_ns       = None   # 타이머에서 처리할 로봇 네임스페이스 대기열
-        self._deactivate_cam   = False  # 타이머에서 카메라 구독 해제 요청 플래그
 
         # ── 동적 퍼블리셔·구독자 (네임스페이스 확정 후 생성) ──
         self.audio_pub        = None   # /robotN/cmd_audio        — cmd_callback 에서 생성
@@ -358,22 +357,29 @@ class ParkingDetectionNode(Node):
 
     def _activation_timer(self):
         '''
-        10Hz 타이머 콜백. _pending_ns 가 세팅돼 있으면 카메라 구독·퍼블리셔를 (재)생성한다.
-        spin 루프와 동일 스레드에서 실행되므로 wait set 재구성이 안전하다.
+        10Hz 타이머 콜백. spin 루프와 동일 컨텍스트에서 실행되므로
+        create_subscription / destroy_subscription 이 안전하다.
 
-        같은 로봇 네임스페이스가 이미 활성화돼 있으면 스킵한다.
-        다른 로봇으로 전환 시 기존 구독을 먼저 해제한 뒤 새로 생성한다.
+        두 가지 역할을 순서대로 처리한다:
+          1. 카메라 구독 해제:
+             mode == None 인데 _cam_sub 이 살아있으면 즉시 해제한다.
+             (confirmed 후 image_callback 이 mode = None 을 세팅하므로
+              플래그 없이 상태만으로 판단 가능 → 플래그 분실 버그 원천 제거)
+          2. 카메라 구독 생성:
+             _pending_ns 가 세팅돼 있으면 새 구독·퍼블리셔를 생성한다.
         '''
-        # ── 카메라 구독 해제 요청 처리 (confirmed 후 image_callback 에서 세팅) ──
-        if self._deactivate_cam:
-            self._deactivate_cam = False
-            if self._cam_sub is not None:
-                self.destroy_subscription(self._cam_sub)
-                self._cam_sub = None
-                self.get_logger().info("[activation_timer] 카메라 구독 해제 완료 — 대기 중")
-            return   # 이번 틱은 해제만 처리, pending_ns 는 다음 틱에서 처리
+        # ── 1단계: mode == None 이고 _cam_sub 살아있으면 해제 ──────────────────
+        if self.mode is None and self._cam_sub is not None:
+            self.destroy_subscription(self._cam_sub)
+            self._cam_sub = None
+            self.get_logger().info("[activation_timer] 카메라 구독 해제 완료 — 대기 중")
 
+        # ── 2단계: pending_ns 있으면 새 구독 생성 ──────────────────────────────
         if self._pending_ns is None:
+            return
+
+        # mode 가 아직 None 이면 start 처리가 덜 된 것 — 다음 틱에서 처리
+        if self.mode is None:
             return
 
         ns = self._pending_ns
@@ -387,14 +393,13 @@ class ParkingDetectionNode(Node):
         topic_audio = f"{ns}/cmd_audio"
         topic_done  = f"{ns}/capture_done"
 
-        # ── 기존 카메라 구독 해제 ──
+        # ── 기존 카메라 구독 해제 (로봇 전환 시) ──
         if self._cam_sub is not None:
             self.destroy_subscription(self._cam_sub)
             self._cam_sub = None
-            self.get_logger().info("[activation_timer] 기존 카메라 구독 해제")
+            self.get_logger().info("[activation_timer] 기존 카메라 구독 해제 (로봇 전환)")
 
         # ── 카메라 구독 (BEST_EFFORT — OAK-D 드라이버가 BEST_EFFORT로 퍼블리시) ──
-        # 구독자가 RELIABLE이면 QoS 협상 실패로 연결 안 맺힘 → BEST_EFFORT 필수
         cam_qos = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
             history=HistoryPolicy.KEEP_LAST,
@@ -699,8 +704,6 @@ class ParkingDetectionNode(Node):
                 track.confirmed_uploaded = True                  # 이후 재업로드 방지
 
                 # ── 촬영 완료 신호 퍼블리시 (CAPTURE_DONE_REPEAT 회 반복) ────────
-                # 네트워크 불안정 대비: 0.2초 간격으로 5회 반복 발행한다.
-                # 별도 데몬 스레드에서 실행해 image_callback 블로킹을 방지한다.
                 threading.Thread(
                     target=self._publish_capture_done_repeated,
                     daemon=True
@@ -709,14 +712,13 @@ class ParkingDetectionNode(Node):
                     f"[capture_done] True × {CAPTURE_DONE_REPEAT}회 발송 시작"
                 )
 
-                # ── 카메라 구독 해제 요청 ─────────────────────────────────────
-                # image_callback 은 spin 루프의 콜백 컨텍스트이므로
-                # 여기서 destroy_subscription 을 직접 호출하면 wait set 충돌 위험.
-                # 플래그만 세팅하고 _activation_timer 에서 안전하게 처리한다.
-                self._deactivate_cam = True
+                # ── mode = None 세팅 → _activation_timer 가 자동으로 구독 해제 ──
+                # _activation_timer 는 10Hz 로 "mode is None and _cam_sub is not None"
+                # 상태를 감지해 destroy_subscription 을 처리한다.
+                # 플래그 방식 대신 상태 직접 감지 방식이므로 분실 버그가 없다.
                 self.mode = None
                 self.ns   = None
-                self.get_logger().info("[cam_sub] 구독 해제 요청 → 타이머 대기")
+                self.get_logger().info("[confirmed] mode=None 세팅 → 타이머가 구독 해제 예정")
 
             next_tracks.append(track)   # confirmed 여부 무관하게 추적 목록 유지
 
