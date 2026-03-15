@@ -100,13 +100,6 @@ LOCAL_TEMP_DIR        = "/tmp/click_car_amr"
 CAPTURE_DONE_REPEAT   = 5
 CAPTURE_DONE_INTERVAL = 0.2
 
-# ── image_callback 처리 주기 ──────────────────────────────────────────────────
-# 카메라 토픽은 30fps로 수신하지만, YOLO 추론은 2Hz(0.5초마다)만 수행한다.
-# 4개 노드 동시 실행 환경에서 CPU/GPU 부하 절감이 목적.
-# 번호판이 수초간 카메라 앞에 있으므로 2Hz로도 confirmed는 충분히 달성된다.
-IMAGE_PROCESS_HZ  = 2.0
-IMAGE_PROCESS_INTERVAL = 1.0 / IMAGE_PROCESS_HZ   # 0.5초
-
 # ── 트랙 grace period ─────────────────────────────────────────────────────────
 # YOLO가 탐지 실패해도 이 시간(초) 이내라면 트랙을 유지한다.
 # 2Hz 추론에서 1프레임 놓침 = 0.5초 공백이므로 2초면 연속 4프레임 탐지 실패도 허용.
@@ -284,7 +277,12 @@ class ParkingDetectionNode(Node):
         self.parking_timeout   = None
         self._audio_stop_event = threading.Event()
         self._local_case_key   = None
-        self._last_frame_time  = 0.0
+
+        # ── 디스플레이 큐 ─────────────────────────────────────────────────────
+        # imshow/waitKey 는 반드시 메인 스레드에서 호출해야 한다.
+        # 콜백(워커 스레드)은 프레임을 여기에 넣고, main()이 꺼내서 표시한다.
+        # maxsize=1: 항상 최신 프레임만 유지 (오래된 프레임 자동 드랍)
+        self.display_queue = queue.Queue(maxsize=1)
 
         # ── Callback group ──
         self._cmd_group = ReentrantCallbackGroup()
@@ -344,8 +342,6 @@ class ParkingDetectionNode(Node):
 
         os.makedirs(LOCAL_TEMP_DIR, exist_ok=True)
 
-        cv2.namedWindow("Plate Checking", cv2.WINDOW_NORMAL)
-        cv2.resizeWindow("Plate Checking", YOLO_IMG_SIZE, YOLO_IMG_SIZE)
         self.get_logger().info(
             f"{_GRN}[READY] /robot2/start 또는 /robot3/start 대기 중...{_RST}"
         )
@@ -431,7 +427,6 @@ class ParkingDetectionNode(Node):
         self._audio_stop_event.set()   # 이전 알림음 즉시 중단
         self._clear_local_temp()       # 미확정 임시 파일 삭제
         self.tracked_vehicles = []
-        self._last_frame_time = 0.0
         self.mode             = cmd
         self.ns               = ns     # ← 이 플래그로 image_callback 이 필터링
 
@@ -526,20 +521,13 @@ class ParkingDetectionNode(Node):
             self.get_logger().warn("이미지 디코딩 실패", throttle_duration_sec=5.0)
             return
 
-        # ── 대기 상태(self.ns is None): 화면만 표시, YOLO 스킵 ──────────────
-        # 두 로봇 영상이 번갈아 imshow에 표시됨
+        # ── 대기 상태(self.ns is None): 화면용 큐에 넣고 YOLO 스킵 ────────────
         if self.ns is None:
-            cv2.imshow("Plate Checking", frame)
-            cv2.waitKey(1)
+            try:
+                self.display_queue.put_nowait(frame)
+            except queue.Full:
+                pass
             return
-
-        # ── 2Hz 스로틀: 처리 간격 미달 프레임은 화면만 갱신 ───────────────
-        now = time.monotonic()
-        if now - self._last_frame_time < IMAGE_PROCESS_INTERVAL:
-            cv2.imshow("Plate Checking", frame)
-            cv2.waitKey(1)
-            return
-        self._last_frame_time = now
 
         # ── YOLO 추론 및 추적 ───────────────────────────────────────────────
         cars, ids       = self._detect(frame)
@@ -728,8 +716,10 @@ class ParkingDetectionNode(Node):
                         (bar_x1, bar_y - 4),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 1)
 
-        cv2.imshow("Plate Checking", frame)
-        cv2.waitKey(1)
+        try:
+            self.display_queue.put_nowait(frame)
+        except queue.Full:
+            pass
 
     # ── capture_done 반복 발행 ───────────────────
 
@@ -1012,17 +1002,33 @@ def main(args=None):
     rclpy.init(args=args)
     node = ParkingDetectionNode()
 
-    # MultiThreadedExecutor: cmd_callback 이 자체 스레드에서 실행되어
-    # create_subscription / destroy_subscription 을 즉시 안전하게 처리한다.
+    # ── GUI 창 생성 — 반드시 메인 스레드에서 ────────────────────────────────
+    cv2.namedWindow("Plate Checking", cv2.WINDOW_NORMAL)
+    cv2.resizeWindow("Plate Checking", YOLO_IMG_SIZE, YOLO_IMG_SIZE)
+
     executor = MultiThreadedExecutor()
     executor.add_node(node)
 
+    # executor 를 별도 스레드에서 spin → 메인 스레드는 imshow 전담
+    spin_thread = threading.Thread(target=executor.spin, daemon=True)
+    spin_thread.start()
+
     try:
-        executor.spin()
+        while rclpy.ok():
+            # 디스플레이 큐에서 프레임 꺼내 표시 (메인 스레드 전용)
+            try:
+                frame = node.display_queue.get(timeout=0.05)
+                cv2.imshow("Plate Checking", frame)
+            except queue.Empty:
+                pass
+            # waitKey 는 GUI 이벤트 루프 구동 — 메인 스레드에서만 유효
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
     except KeyboardInterrupt:
         pass
     finally:
         node.destroy_node()
+        cv2.destroyAllWindows()
         if rclpy.ok():
             rclpy.shutdown()
 
