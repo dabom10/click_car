@@ -123,7 +123,7 @@ PRE_DOCK_DIRECTION = TurtleBot4Directions.NORTH
 
 ENFORCEMENT_WAIT_CCTV = 10.0   # CCTV 경로 단속 대기 시간 (초)
 ENFORCEMENT_WAIT_AMR  = 30.0   # AMR 카메라 경로 단속 대기 시간 (초)
-ENFORCEMENT_STOP_DIST = 0.7    # 목표 차량으로부터 정지할 거리 (미터) - 조절 가능
+ENFORCEMENT_STOP_DIST = 0.6    # 목표 차량으로부터 정지할 거리 (미터) - 조절 가능
 TASK_POLL_PERIOD_SEC  = 0.1
 BATTERY_LOW_THRESHOLD = 0.25   # 배터리 복귀 기준 (25%)
 
@@ -264,11 +264,13 @@ def do_enforcement(navigator, node, target_x, target_y, source):
         node.capture_done = False
 
     if source == SOURCE_CCTV:
-        node.cap_start_pub.publish(String(data='cctv_start'))
-        navigator.info('[단속/CCTV] cctv_start(True) pub → capture_done 대기')
+        for _ in range(5):
+            node.cap_start_pub.publish(String(data='cctv_start'))
+            navigator.info('[단속/CCTV] cctv_start(True) pub → capture_done 대기')
     else:
-        node.cap_start_pub.publish(String(data='amr_start'))
-        navigator.info('[단속/AMR] amr_start(True) pub → capture_done 대기')
+        for _ in range(5):
+            node.cap_start_pub.publish(String(data='amr_start'))
+            navigator.info('[단속/AMR] amr_start(True) pub → capture_done 대기')
 
     # capture_done True 수신까지 대기
     while True:
@@ -422,6 +424,7 @@ class AMRNode(Node):
             self.target_y       = y
             self.goto_source    = SOURCE_CCTV
             self.goto_requested = True
+        self.set_status(STATUS_ENFORCE)
         self.get_logger().info(f'[cctv_done] 목표 좌표 수신: ({x}, {y})')
 
     def amr_done_callback(self, msg):
@@ -437,6 +440,7 @@ class AMRNode(Node):
             self.target_y       = y
             self.goto_source    = SOURCE_AMR
             self.goto_requested = True
+        self.set_status(STATUS_ENFORCE)
         self.get_logger().info(f'[amr_done] 목표 좌표 수신: ({x}, {y})')
 
     def capture_done_callback(self, msg):
