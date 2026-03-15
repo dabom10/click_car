@@ -263,18 +263,18 @@ class ParkingDetectionNode(Node):
     '''
     카메라 영상을 받아 불법주정차를 단속하는 메인 ROS2 노드.
 
-    [구독 관리 설계 — MultiThreadedExecutor 기반]
-      cmd_callback 은 ReentrantCallbackGroup 에 배치되어 자체 스레드에서 실행된다.
-      _sub_lock (threading.Lock) 으로 카메라 구독 생성·해제를 보호하여
-      레이스 컨디션 없이 단일 구독 상태를 보장한다.
-      기존 _activation_timer 방식(10Hz 폴링) 은 제거되었다.
+    [구독 관리 설계 — 정적 구독 방식]
+      robot2 / robot3 카메라 구독을 __init__ 에서 모두 생성한다.
+      동적 create/destroy 는 ROS2 executor wait set 타이밍 문제를 유발하므로 사용하지 않는다.
+      self.ns 플래그로 어느 로봇의 프레임을 처리할지 결정한다.
+      퍼블리셔(오디오, capture_done)도 두 로봇 모두 미리 생성한다.
     '''
 
     def __init__(self):
         super().__init__("parking_detection_node")
 
         # ── 상태 변수 ──
-        self.ns                = None
+        self.ns                = None   # 현재 활성 로봇 네임스페이스 (None = 대기)
         self.tracked_vehicles  = []
         self.save_queue        = queue.Queue(maxsize=SAVE_QUEUE_MAXSIZE)
         self.db_ref            = None
@@ -284,23 +284,9 @@ class ParkingDetectionNode(Node):
         self.parking_timeout   = None
         self._audio_stop_event = threading.Event()
         self._local_case_key   = None
+        self._last_frame_time  = 0.0
 
-        # ── 동적 퍼블리셔·구독자 ──
-        self.audio_pub        = None
-        self.capture_done_pub = None
-        self._cam_sub         = None
-
-        # ── 구독 관리용 Lock ──────────────────────────────────────────────────
-        # cmd_callback 이 MultiThreadedExecutor 에서 별도 스레드로 실행되므로
-        # _cam_sub 생성·해제·참조를 Lock 으로 보호한다.
-        self._sub_lock = threading.Lock()
-
-        # ── image_callback 스로틀 ──
-        self._last_frame_time = 0.0
-
-        # ── Callback group (cmd_callback 전용) ──────────────────────────────
-        # ReentrantCallbackGroup: 동일 그룹의 콜백이 동시에 실행될 수 있음.
-        # image_callback 과 cmd_callback 이 독립적으로 돌아야 하므로 분리한다.
+        # ── Callback group ──
         self._cmd_group = ReentrantCallbackGroup()
 
         # ── 초기화 ──
@@ -308,7 +294,50 @@ class ParkingDetectionNode(Node):
         self._init_firebase()
         self._init_ocr()
         self._init_gcv()
-        self._init_cmd_subscribers()
+
+        # ── 카메라 QoS ──
+        cam_qos = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1
+        )
+
+        # ── robot2 / robot3 카메라 구독 — __init__ 에서 모두 생성 ─────────────
+        # executor 가 완전히 구동되기 전에 생성하므로 wait set 등록이 보장된다.
+        # image_callback 내부에서 self.ns 로 필터링하여 활성 로봇 프레임만 처리한다.
+        self.create_subscription(
+            CompressedImage,
+            "/robot2/oakd/rgb/image_raw/compressed",
+            lambda msg: self.image_callback(msg, "/robot2"),
+            cam_qos
+        )
+        self.create_subscription(
+            CompressedImage,
+            "/robot3/oakd/rgb/image_raw/compressed",
+            lambda msg: self.image_callback(msg, "/robot3"),
+            cam_qos
+        )
+
+        # ── CMD 구독 ──
+        self.create_subscription(
+            String, TOPIC_CMD_ROBOT2,
+            lambda msg: self.cmd_callback(msg, "/robot2"),
+            10, callback_group=self._cmd_group
+        )
+        self.create_subscription(
+            String, TOPIC_CMD_ROBOT3,
+            lambda msg: self.cmd_callback(msg, "/robot3"),
+            10, callback_group=self._cmd_group
+        )
+
+        # ── 퍼블리셔 — 두 로봇 모두 미리 생성 ───────────────────────────────
+        self._pubs = {
+            ns: {
+                "audio":        self.create_publisher(AudioNoteVector, f"{ns}/cmd_audio",     10),
+                "capture_done": self.create_publisher(Bool,             f"{ns}/capture_done",  10),
+            }
+            for ns in ["/robot2", "/robot3"]
+        }
 
         # 업로드·OCR 전담 데몬 스레드
         threading.Thread(target=self._upload_worker, daemon=True).start()
@@ -362,41 +391,17 @@ class ParkingDetectionNode(Node):
         except Exception as e:
             self.get_logger().error(f"{_RED}GCV init failed (PaddleOCR fallback 사용): {e}{_RST}")
 
-    def _init_cmd_subscribers(self):
-        '''
-        /robot2/start, /robot3/start 를 ReentrantCallbackGroup 으로 구독한다.
-        같은 그룹에 배치해도 두 토픽의 콜백이 동시에 실행될 수 있으나,
-        _sub_lock 이 구독 생성·해제를 직렬화하므로 안전하다.
-        '''
-        self.create_subscription(
-            String, TOPIC_CMD_ROBOT2,
-            lambda msg: self.cmd_callback(msg, "/robot2"),
-            10,
-            callback_group=self._cmd_group
-        )
-        self.create_subscription(
-            String, TOPIC_CMD_ROBOT3,
-            lambda msg: self.cmd_callback(msg, "/robot3"),
-            10,
-            callback_group=self._cmd_group
-        )
-        self.get_logger().info(
-            f"CMD 구독 등록: {TOPIC_CMD_ROBOT2}, {TOPIC_CMD_ROBOT3}"
-        )
-
     # ── 모드 제어 ────────────────────────────────
 
     def cmd_callback(self, msg: String, ns: str):
         '''
-        start 토픽 수신 콜백. MultiThreadedExecutor 에서 자체 스레드로 실행된다.
+        start 토픽 수신 콜백.
 
-        [흐름]
-          1. 모드 파싱 ("amr_start" / "cctv_start")
-          2. _sub_lock 획득
-          3. 기존 카메라 구독 즉시 해제
-          4. 상태 초기화
-          5. 새 카메라 구독·퍼블리셔 생성
-          6. 알림음 스레드 시작 (amr_start 전용)
+        [설계 변경 — 정적 구독 방식]
+          카메라 구독은 __init__ 에서 이미 생성되어 있다.
+          여기서는 self.ns / self.mode 플래그만 세팅한다.
+          image_callback 이 self.ns 를 보고 해당 로봇 프레임만 처리한다.
+          create_subscription / destroy_subscription 은 일절 호출하지 않는다.
         '''
         raw   = msg.data.strip()
         token = raw.split(":")[0]
@@ -422,47 +427,17 @@ class ParkingDetectionNode(Node):
             )
             return
 
-        # ── 이전 세션 정리 + 새 구독 생성 (Lock 보호) ──────────────────────
-        with self._sub_lock:
-            # 기존 카메라 구독 즉시 해제
-            if self._cam_sub is not None:
-                self.destroy_subscription(self._cam_sub)
-                self._cam_sub = None
-                self.get_logger().info(
-                    f"{_YEL}[SUB] 기존 카메라 구독 해제 완료{_RST}"
-                )
-
-            # 상태 초기화
-            self.mode             = cmd
-            self.ns               = ns
-            self.tracked_vehicles = []
-            self._last_frame_time = 0.0
-            self._audio_stop_event.set()     # 이전 알림음 즉시 중단
-            self._clear_local_temp()         # 미확정 임시 파일 삭제
-
-            topic_rgb   = f"{ns}/oakd/rgb/image_raw/compressed"
-            topic_audio = f"{ns}/cmd_audio"
-            topic_done  = f"{ns}/capture_done"
-
-            # ── 카메라 구독 생성 ────────────────────────────────────────────
-            cam_qos = QoSProfile(
-                reliability=ReliabilityPolicy.BEST_EFFORT,
-                history=HistoryPolicy.KEEP_LAST,
-                depth=1
-            )
-            self._cam_sub = self.create_subscription(
-                CompressedImage, topic_rgb, self.image_callback, cam_qos
-            )
-
-            # ── 퍼블리셔 재생성 ─────────────────────────────────────────────
-            self.audio_pub        = self.create_publisher(AudioNoteVector, topic_audio, 10)
-            self.capture_done_pub = self.create_publisher(Bool, topic_done, 10)
+        # ── 상태 초기화 및 플래그 세팅 ─────────────────────────────────────
+        self._audio_stop_event.set()   # 이전 알림음 즉시 중단
+        self._clear_local_temp()       # 미확정 임시 파일 삭제
+        self.tracked_vehicles = []
+        self._last_frame_time = 0.0
+        self.mode             = cmd
+        self.ns               = ns     # ← 이 플래그로 image_callback 이 필터링
 
         self.get_logger().info(
             f"{_GRN}[ACTIVE] ns={ns}  mode={cmd}{_RST}\n"
-            f"  카메라 구독 : {topic_rgb}\n"
-            f"  오디오 발행 : {topic_audio}\n"
-            f"  완료 발행   : {topic_done}"
+            f"  처리할 카메라 : {ns}/oakd/rgb/image_raw/compressed"
         )
 
         # ── amr_start: 경보음 스레드 시작 ──
@@ -493,14 +468,9 @@ class ParkingDetectionNode(Node):
         if self._audio_stop_event.is_set():
             return
 
-        # audio_pub 생성 대기 (cmd_callback Lock 해제 직후이므로 이미 생성됨)
-        for _ in range(10):
-            if self.audio_pub is not None:
-                break
-            time.sleep(0.05)
-
-        if self.audio_pub is None:
-            self.get_logger().warn(f"{_YEL}[Audio] audio_pub 미생성 — 경보음 스킵{_RST}")
+        audio_pub = self._pubs.get(self.ns, {}).get("audio")
+        if audio_pub is None:
+            self.get_logger().warn(f"{_YEL}[Audio] ns={self.ns} 퍼블리셔 없음 — 스킵{_RST}")
             return
 
         msg        = AudioNoteVector()
@@ -515,7 +485,7 @@ class ParkingDetectionNode(Node):
             )
             for freq, dur_ns in ALERT_NOTES
         ]
-        self.audio_pub.publish(msg)
+        audio_pub.publish(msg)
 
         total_sec = sum(dur_ns for _, dur_ns in ALERT_NOTES) / 1_000_000_000
         self._audio_stop_event.wait(timeout=total_sec)
@@ -524,26 +494,29 @@ class ParkingDetectionNode(Node):
             stop_msg        = AudioNoteVector()
             stop_msg.append = False
             stop_msg.notes  = []
-            if self.audio_pub is not None:
-                self.audio_pub.publish(stop_msg)
+            audio_pub.publish(stop_msg)
 
         self.get_logger().info("[Audio] 경보음 종료")
 
     # ── 메인 파이프라인 ──────────────────────────
 
-    def image_callback(self, msg: CompressedImage):
+    def image_callback(self, msg: CompressedImage, msg_ns: str):
         '''
-        새 프레임 수신 콜백.
+        새 프레임 수신 콜백. robot2 / robot3 각각 별도 콜백으로 등록되어 있다.
 
-        [2Hz 스로틀]
-          카메라는 ~30fps 로 발행되지만 IMAGE_PROCESS_INTERVAL(0.5초) 미만 간격의
-          프레임은 건너뛴다. 4노드 동시 실행 환경에서 CPU/GPU 부하를 줄이기 위함.
-          YOLO 추론을 안 하는 프레임도 화면 갱신은 수행한다.
+        [네임스페이스 필터링]
+          msg_ns 가 self.ns(현재 활성 로봇)와 다르면 즉시 반환한다.
+          두 카메라를 모두 상시 구독하지만, 실제 처리는 활성 로봇 것만 한다.
+          self.ns == None 이면 대기 상태 — 모든 프레임 스킵.
 
         [압축 해제]
-          CompressedImage.data 는 JPEG 인코딩된 바이트 배열이다.
-          np.frombuffer → cv2.imdecode 로 압축 해제 + BGR 변환을 한 번에 수행한다.
+          CompressedImage.data 는 JPEG 바이트. np.frombuffer → cv2.imdecode.
         '''
+        # ── 비활성 로봇 프레임 즉시 드랍 ────────────────────────────────────
+        # 활성 로봇이 있는데 다른 로봇 프레임이 오면 드랍
+        if self.ns is not None and msg_ns != self.ns:
+            return
+
         # ── JPEG 압축 해제 ──────────────────────────────────────────────────
         frame = cv2.imdecode(
             np.frombuffer(bytes(msg.data), dtype=np.uint8),
@@ -553,7 +526,9 @@ class ParkingDetectionNode(Node):
             self.get_logger().warn("이미지 디코딩 실패", throttle_duration_sec=5.0)
             return
 
-        if self.mode is None:
+        # ── 대기 상태(self.ns is None): 화면만 표시, YOLO 스킵 ──────────────
+        # 두 로봇 영상이 번갈아 imshow에 표시됨
+        if self.ns is None:
             cv2.imshow("Plate Checking", frame)
             cv2.waitKey(1)
             return
@@ -689,25 +664,23 @@ class ParkingDetectionNode(Node):
                 self._enqueue(frame, track, event="confirmed")
                 track.confirmed_uploaded = True
 
+                confirmed_ns = self.ns   # 스냅샷 (mode=None 전에 저장)
                 threading.Thread(
                     target=self._publish_capture_done_repeated,
+                    args=(confirmed_ns,),
                     daemon=True
                 ).start()
                 self.get_logger().info(
                     f"{_CYN}[CONFIRMED] 번호판 확정 → capture_done ×{CAPTURE_DONE_REPEAT} 발송{_RST}"
                 )
 
-                # ── 카메라 구독 해제 (Lock 보호) ────────────────────────────
-                # confirmed 완료 → 즉시 구독 해제하고 대기 상태로 복귀
-                with self._sub_lock:
-                    self.mode = None
-                    self.ns   = None
-                    if self._cam_sub is not None:
-                        self.destroy_subscription(self._cam_sub)
-                        self._cam_sub = None
-                        self.get_logger().info(
-                            f"{_YEL}[SUB] confirmed 완료 → 카메라 구독 해제, 대기 중{_RST}"
-                        )
+                # ── 대기 상태로 복귀 (플래그만 리셋) ───────────────────────
+                # 구독은 계속 살아있음 — 다음 start 신호 때까지 ns 필터로 드랍
+                self.mode = None
+                self.ns   = None
+                self.get_logger().info(
+                    f"{_YEL}[DONE] confirmed 완료 → 대기 상태 복귀{_RST}"
+                )
 
             next_tracks.append(track)
 
@@ -760,13 +733,14 @@ class ParkingDetectionNode(Node):
 
     # ── capture_done 반복 발행 ───────────────────
 
-    def _publish_capture_done_repeated(self):
+    def _publish_capture_done_repeated(self, ns: str):
+        pub = self._pubs.get(ns, {}).get("capture_done")
+        if pub is None:
+            return
         for i in range(CAPTURE_DONE_REPEAT):
-            if self.capture_done_pub is None:
-                break
             done_msg      = Bool()
             done_msg.data = True
-            self.capture_done_pub.publish(done_msg)
+            pub.publish(done_msg)
             self.get_logger().info(f"[capture_done] {i+1}/{CAPTURE_DONE_REPEAT}")
             if i < CAPTURE_DONE_REPEAT - 1:
                 time.sleep(CAPTURE_DONE_INTERVAL)
