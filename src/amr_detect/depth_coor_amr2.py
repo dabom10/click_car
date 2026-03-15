@@ -40,7 +40,7 @@ from ultralytics import YOLO
 # ──────────────────────────────────────────
 # 설정값 (기존과 동일)
 # ──────────────────────────────────────────
-ROBOT_NAMESPACE  = "/robot3"
+ROBOT_NAMESPACE  = "/robot2"
 MODEL_PATH       = "/home/rokey/click_car/models/amr.pt"
 
 CONF_THRESHOLD   = 0.70
@@ -60,7 +60,7 @@ CAM_OFFSET_X = -0.10  # 로봇 중심 기준 앞뒤 (m) — 뒤쪽이면 음수,
 CAM_OFFSET_Y =  0.00  # 로봇 중심 기준 좌우 (m) — 정중앙
 CAM_OFFSET_Z =  0.25  # 지면에서 카메라 렌즈까지 높이 (m) — 실측 25cm
 
-WINDOW_NAME      = "Parking Detection - AMR1(robot3)"
+WINDOW_NAME      = "Parking Detection - AMR2(robot2)"
 PUBLISH_INTERVAL = 0.2
 
 # 트래킹
@@ -106,7 +106,7 @@ ILLEGAL_ZONES = [
     # 구역1: x=[-1.910, -0.800], y=[0.460, 1.600]
     (-1.910, -0.800,  0.460,  1.600),
     # 구역2: x=[-1.240,  0.504], y=[-5.000, -4.300]
-    (-1.240,  0.504, -5.000, -4.300),
+    (-1.240,  0.504, -5.500, -4.300),
 ]
 
 # ── EKF 파라미터 ──────────────────────────────
