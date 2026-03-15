@@ -25,7 +25,7 @@ from ultralytics import YOLO
 # 설정값
 # ──────────────────────────────────────────
 ROBOT_NAMESPACE  = "/robot3"
-MODEL_PATH       = "/home/rokey/click_car/models/amr.pt"
+MODEL_PATH       = "/home/kyb/click_car/models/amr.pt"
 
 CONF_THRESHOLD   = 0.70
 YOLO_IMG_SIZE    = 704
@@ -67,7 +67,7 @@ ANGULAR_AVG_WINDOW     = 5
 
 # 불법주정차 구역 (map 좌표계, x_min, x_max, y_min, y_max)
 ILLEGAL_ZONES = [
-    (-1.910, -0.800,  0.460,  1.600),  # 구역1
+    (-2.04, -0.694,  0.0,  1.850),  # 구역1
     (-1.240,  0.504, -5.000, -4.300),  # 구역2
 ]
 
