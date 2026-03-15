@@ -78,6 +78,10 @@ TEMP_IMAGE_DIR   = "/tmp/click_car_cctv"
 
 ILLEGAL_PARK_SEC = 90.0    # 이 시간(초) 이상 연속 감지 시 불법주정차 확정 + cctv_done 퍼블리시
 
+# ── cctv_done 재전송 횟수 ─────────────────────────────────────────────────────
+CCTV_DONE_REPEAT   = 5     # cctv_done 을 몇 번 반복 발행할지
+CCTV_DONE_INTERVAL = 0.2   # 반복 발행 간격 (초)
+
 # ROS2 퍼블리시 토픽
 TOPIC_CCTV_DONE  = "/cctv_done"   # 불법주정차 확정 시 '<x>,<y>' 문자열 퍼블리시
 
@@ -647,30 +651,35 @@ class WebcamDetectorNode(Node):
                         initial_image_path=initial_path,
                     )
 
-                # ── /cctv_done 퍼블리시 ──────────────────────────────────────
+                # ── /cctv_done 퍼블리시 (CCTV_DONE_REPEAT 회 반복) ─────────────
                 # 메시지 형식: "<center_x>,<center_y>"  (단위: m)
-                coord_msg      = String()
-                coord_msg.data = f"{car['center_x']},{car['center_y']}"
+                # 네트워크 불안정 대비: 별도 데몬 스레드에서 반복 발행한다.
+                coord_str = f"{car['center_x']},{car['center_y']}"
 
                 if ROBOT_STATUS_MODE:
-                    # patrol 중인 로봇 판별 (robot2 우선, 둘 다 아니면 기존 토픽)
                     r2_patrol = (self._robot2_status == "patrol")
                     r3_patrol = (self._robot3_status == "patrol")
                     if r2_patrol:
-                        self._pub_robot2_cctv.publish(coord_msg)
+                        pub       = self._pub_robot2_cctv
                         topic_used = "/robot2/cctv_done"
                     elif r3_patrol:
-                        self._pub_robot3_cctv.publish(coord_msg)
+                        pub       = self._pub_robot3_cctv
                         topic_used = "/robot3/cctv_done"
                     else:
-                        self.cctv_done_pub.publish(coord_msg)
+                        pub       = self.cctv_done_pub
                         topic_used = TOPIC_CCTV_DONE
                 else:
-                    self.cctv_done_pub.publish(coord_msg)
+                    pub       = self.cctv_done_pub
                     topic_used = TOPIC_CCTV_DONE
 
+                threading.Thread(
+                    target=self._publish_cctv_done_repeated,
+                    args=(pub, coord_str),
+                    daemon=True,
+                ).start()
                 self.get_logger().info(
-                    f"[cctv_done] 퍼블리시: {coord_msg.data}  (ID:{car['id']})  → {topic_used}"
+                    f"[cctv_done] 발송 시작 × {CCTV_DONE_REPEAT}: {coord_str}"
+                    f"  (ID:{car['id']})  → {topic_used}"
                 )
 
             if ENABLE_FIREBASE and self.uploader:
@@ -693,6 +702,22 @@ class WebcamDetectorNode(Node):
             # 'q' 키 입력 시 ROS2 노드 종료
             self.get_logger().info("[q] 종료 요청")
             raise SystemExit
+
+    # ── cctv_done 반복 발행 ─────────────────────
+
+    def _publish_cctv_done_repeated(self, pub, coord_str: str):
+        '''
+        cctv_done 토픽을 CCTV_DONE_REPEAT 회 반복 발행한다.
+        네트워크 패킷 손실 대비용. 별도 데몬 스레드에서 호출된다.
+        pub: 사용할 퍼블리셔 객체 (robot2/robot3/기본 중 선택된 것)
+        '''
+        for i in range(CCTV_DONE_REPEAT):
+            msg      = String()
+            msg.data = coord_str
+            pub.publish(msg)
+            self.get_logger().info(f"[cctv_done] {i+1}/{CCTV_DONE_REPEAT}: {coord_str}")
+            if i < CCTV_DONE_REPEAT - 1:
+                time.sleep(CCTV_DONE_INTERVAL)
 
     # ── 로봇 상태 구독 콜백 ─────────────────────
 
