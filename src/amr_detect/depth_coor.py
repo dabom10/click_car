@@ -97,7 +97,7 @@ ROI_TOP_RATIO = 0.30   # 0.0~1.0, 상단 몇 % 를 제외할지
 #   실제 회전 구간:   0.10 rad/s 이상
 # TurtleBot4 odom은 wheel encoder 기반으로 순간값이 노이즈성으로 튀는 경우 있음
 # → 이동 평균(ANGULAR_AVG_WINDOW 프레임)으로 안정화 후 임계값 비교
-ROTATE_SUPPRESS_THRESH = 0.01   # rad/s (평균값 기준)
+ROTATE_SUPPRESS_THRESH = 0.10   # rad/s (평균값 기준)
 ANGULAR_AVG_WINDOW     = 5      # 평균 낼 프레임 수 (odom ~50Hz → 약 0.1초)
 
 # ── Hard Negative 자동 저장 ───────────────────
