@@ -262,11 +262,13 @@ def do_enforcement(navigator, node, target_x, target_y, source):
         node.capture_done = False
 
     if source == SOURCE_CCTV:
-        node.cap_start_pub.publish(String(data='cctv'))
-        navigator.info('[단속/CCTV] cctv_start(True) pub → capture_done 대기')
+        for _ in range(5):
+            node.cap_start_pub.publish(String(data='cctv_start'))
+            navigator.info('[단속/CCTV] cctv_start(True) pub → capture_done 대기')
     else:
-        node.cap_start_pub.publish(String(data='amr'))
-        navigator.info('[단속/AMR] amr_start(True) pub → capture_done 대기')
+        for _ in range(5):
+            node.cap_start_pub.publish(String(data='amr_start'))
+            navigator.info('[단속/AMR] amr_start(True) pub → capture_done 대기')
 
     # capture_done True 수신까지 대기
     while True:
