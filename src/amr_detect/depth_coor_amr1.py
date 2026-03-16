@@ -269,7 +269,7 @@ class ParkingDetectionNode(Node):
 
     def _init_publisher(self):
         qos_pub = QoSProfile(reliability=ReliabilityPolicy.RELIABLE,
-                             history=HistoryPolicy.KEEP_LAST, depth=10)
+                             history=HistoryPolicy.KEEP_LAST, depth=1)
         self.amr_target_pub = self.create_publisher(String, TOPIC_AMR_TARGET, qos_pub)
         self.get_logger().info(f"Pub: {TOPIC_AMR_TARGET}")
 
