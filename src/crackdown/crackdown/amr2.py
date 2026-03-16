@@ -121,7 +121,7 @@ PRE_DOCK_DIRECTION = TurtleBot4Directions.NORTH
 
 ENFORCEMENT_WAIT_CCTV = 10.0   # CCTV 경로 단속 대기 시간 (초)
 ENFORCEMENT_WAIT_AMR  = 30.0   # AMR 카메라 경로 단속 대기 시간 (초)
-ENFORCEMENT_STOP_DIST = 0.7    # 목표 차량으로부터 정지할 거리 (미터) - 조절 가능
+ENFORCEMENT_STOP_DIST = 0.6    # 목표 차량으로부터 정지할 거리 (미터) - 조절 가능
 TASK_POLL_PERIOD_SEC  = 0.1
 BATTERY_LOW_THRESHOLD = 0.25   # 배터리 복귀 기준 (25%)
 
@@ -330,7 +330,7 @@ class AMRNode(Node):
             String,
             f'/{robot_ns}/amr_done',
             self.amr_done_callback,
-            1
+            10
         )
         self.create_subscription(
             Bool,
@@ -357,7 +357,7 @@ class AMRNode(Node):
         )
 
         # ── 발행 ─────────────────────────────────────
-        self.cap_start_pub = self.create_publisher(String, f'/{robot_ns}/cap_start', 10)        
+        self.cap_start_pub = self.create_publisher(String, f'/{robot_ns}/start', 10)        
         # self.cctv_start_pub = self.create_publisher(Bool, f'/{robot_ns}/cctv_start', 10)
         # self.amr_start_pub  = self.create_publisher(Bool, f'/{robot_ns}/amr_start',  10)
         # ── 상태 퍼블리셔 ──────────────────────────────
@@ -422,6 +422,7 @@ class AMRNode(Node):
             self.target_y       = y
             self.goto_source    = SOURCE_CCTV
             self.goto_requested = True
+        self.set_status(STATUS_ENFORCE)
         self.get_logger().info(f'[cctv_done] 목표 좌표 수신: ({x}, {y})')
 
     def amr_done_callback(self, msg):
@@ -437,6 +438,7 @@ class AMRNode(Node):
             self.target_y       = y
             self.goto_source    = SOURCE_AMR
             self.goto_requested = True
+        self.set_status(STATUS_ENFORCE)
         self.get_logger().info(f'[amr_done] 목표 좌표 수신: ({x}, {y})')
 
     def capture_done_callback(self, msg):
@@ -478,7 +480,7 @@ def patrol_cycle(node: AMRNode, is_first_cycle: bool = False):
         node.stop_requested = False
         node.battery_low    = False
         node.capture_done   = False
-        
+
         node.goto_requested = False
         node.target_x       = None
         node.target_y       = None
