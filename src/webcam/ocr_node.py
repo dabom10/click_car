@@ -662,15 +662,16 @@ class ParkingDetectionNode(Node):
                     f"{_CYN}[CONFIRMED] 번호판 확정 → capture_done ×{CAPTURE_DONE_REPEAT} 발송{_RST}"
                 )
 
-                # ── 대기 상태로 복귀 (플래그만 리셋) ───────────────────────
-                # 구독은 계속 살아있음 — 다음 start 신호 때까지 ns 필터로 드랍
                 self.mode = None
                 self.ns   = None
                 self.get_logger().info(
                     f"{_YEL}[DONE] confirmed 완료 → 대기 상태 복귀{_RST}"
                 )
-
-            next_tracks.append(track)
+                # confirmed 트랙은 next_tracks에 추가하지 않음
+                # ← 이것이 핵심: confirmed 트랙이 살아있으면 다음 start 세션에서
+                #   새 차량이 IoU 매칭되어 initial 이벤트가 발생하지 않는 버그 방지
+            else:
+                next_tracks.append(track)   # confirmed 아닌 트랙만 유지
 
         self.tracked_vehicles = next_tracks
 
