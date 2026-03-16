@@ -25,7 +25,7 @@ from ultralytics import YOLO
 # 설정값
 # ──────────────────────────────────────────
 ROBOT_NAMESPACE  = "/robot2"
-MODEL_PATH       = "/home/rokey/click_car/models/amr.pt"
+MODEL_PATH       = "/home/kyb/click_car/models/amr.pt"
 
 CONF_THRESHOLD   = 0.70
 YOLO_IMG_SIZE    = 704
