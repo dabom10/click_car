@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-amr1.py
+amr2.py
 -------
-robot3 기준 테스트 - 출발 신호 수신 후 순찰 시작
+robot2 기준 테스트 - 출발 신호 수신 후 순찰 시작
 구역 기반 이동 + 단속 + waypoint 9까지 복귀 + 도킹 + 재시작 대기
 
 [전체 동작 흐름]
@@ -42,14 +42,14 @@ robot3 기준 테스트 - 출발 신호 수신 후 순찰 시작
     /{robot_ns}/amr_start       std_msgs/Bool          True = 촬영 시작 (AMR 경로)
 
 실행:
-  ros2 run crackdown amr1 --ros-args -r __ns:=/robot3
+  ros2 run crackdown amr2 --ros-args -r __ns:=/robot2
 
 토픽 송신 테스트:
-  출발: ros2 topic pub /robot3/patrol_command std_msgs/String "{data: 'start'}" --once
-  CCTV: ros2 topic pub /robot3/cctv_done std_msgs/String "{data: '0.5,-4.7'}" --once
-  AMR:  ros2 topic pub /robot3/amr_done  std_msgs/String "{data: '0.5,-4.7'}" --once
-  촬영완료: ros2 topic pub /robot3/capture_done std_msgs/Bool "{data: true}" --once
-  정지: ros2 topic pub /robot3/patrol_command std_msgs/String "{data: 'stop'}" --once
+  출발: ros2 topic pub /robot2/patrol_command std_msgs/String "{data: 'start'}" --once
+  CCTV: ros2 topic pub /robot2/cctv_done std_msgs/String "{data: '0.5,-4.7'}" --once
+  AMR:  ros2 topic pub /robot2/amr_done  std_msgs/String "{data: '0.5,-4.7'}" --once
+  촬영완료: ros2 topic pub /robot2/capture_done std_msgs/Bool "{data: true}" --once
+  정지: ros2 topic pub /robot2/patrol_command std_msgs/String "{data: 'stop'}" --once
 """
 
 import math
@@ -113,7 +113,7 @@ ZONES = [
 PATROL_ORDER  = [0, 1, 2, 3, 4, 5, 6, 7, 8]
 PATROL_LENGTH = len(PATROL_ORDER)
 
-# ── robot3 (AMR 1번) 기준 ─────────────────────────────
+# ── robot2 (AMR 1번) 기준 ─────────────────────────────
 INITIAL_POSITION = [0.1424, 1.769]  
 
 PRE_DOCK_POSITION = [-0.15, 1.83]  
@@ -280,8 +280,8 @@ def do_enforcement(navigator, node, target_x, target_y, source):
 
 
 class AMRNode(Node):
-    def __init__(self, robot_ns='robot3'):
-        super().__init__('amr1_node')
+    def __init__(self, robot_ns='robot2'):
+        super().__init__('amr2_node')
 
         self.robot_ns   = robot_ns
         self.state_lock = threading.Lock()
@@ -328,7 +328,7 @@ class AMRNode(Node):
             String,
             f'/{robot_ns}/amr_done',
             self.amr_done_callback,
-            10
+            1
         )
         self.create_subscription(
             Bool,
@@ -470,7 +470,7 @@ class AMRNode(Node):
 def patrol_cycle(node: AMRNode, is_first_cycle: bool = False):
     navigator = node.navigator
 
-    navigator.info('[robot3] 출발 신호 대기 중...')
+    navigator.info('[robot2] 출발 신호 대기 중...')
     with node.state_lock:
         node.start_patrol   = False
         node.stop_requested = False
@@ -494,7 +494,7 @@ def patrol_cycle(node: AMRNode, is_first_cycle: bool = False):
         if not navigator.getDockedStatus():
             navigator.info('도킹 상태 아님 → 도킹 후 초기 포즈 설정')
             navigator.dock()
-        actual_yaw   = get_current_yaw('robot3')
+        actual_yaw   = get_current_yaw('robot2')
         initial_pose = navigator.getPoseStamped(INITIAL_POSITION, actual_yaw)
         navigator.setInitialPose(initial_pose)
         navigator.waitUntilNav2Active()
@@ -619,7 +619,7 @@ def patrol_cycle(node: AMRNode, is_first_cycle: bool = False):
 def main():
     rclpy.init()
 
-    node = AMRNode(robot_ns='robot3')
+    node = AMRNode(robot_ns='robot2')
 
     executor = MultiThreadedExecutor()
     executor.add_node(node)
