@@ -25,7 +25,7 @@ from ultralytics import YOLO
 # 설정값
 # ──────────────────────────────────────────
 ROBOT_NAMESPACE  = "/robot3"
-MODEL_PATH       = "/home/kyb/click_car/models/amr.pt"
+MODEL_PATH       = "/home/rokey/click_car/models/amr.pt"
 
 CONF_THRESHOLD   = 0.70
 YOLO_IMG_SIZE    = 704
@@ -78,6 +78,9 @@ EKF_SIGMA_Z_K    = 0.005
 EKF_GATE_CHI2    = 7.815
 
 MIN_HISTORY_TO_PUBLISH = 5
+
+# publish 최대 횟수 — 같은 track에서 이 횟수 이상 발행하지 않음
+MAX_PUBLISH_COUNT = 10
 
 
 
@@ -133,12 +136,13 @@ class EKF3D:
 class Track:
     def __init__(self, det: dict, xyz_uv=None):
         now = time.monotonic()
-        self.det        = det
-        self.created_at = now
-        self.last_seen  = now
+        self.det           = det
+        self.created_at    = now
+        self.last_seen     = now
         self.last_ekf_time = now
-        self.history    = deque(maxlen=SMOOTH_WINDOW)
+        self.history       = deque(maxlen=SMOOTH_WINDOW)
         self.ekf: EKF3D | None = None
+        self.publish_count = 0   # 이 track에서 publish한 횟수
 
         if xyz_uv is not None:
             self.history.append(xyz_uv)
@@ -212,7 +216,7 @@ class Track:
 # ================================================================
 class ParkingDetectionNode(Node):
     def __init__(self):
-        super().__init__("parking_detection_node_amr2")
+        super().__init__("parking_detection_node_amr1")
 
         self.last_publish_time  = 0.0
         self.gui_enabled        = True
@@ -630,37 +634,35 @@ class ParkingDetectionNode(Node):
         if now - self.last_publish_time < PUBLISH_INTERVAL:
             return
 
-        published = 0
-
         for idx, (trk_det, smoothed) in enumerate(smoothed_targets, 1):
             if smoothed is None:
                 continue
 
-            # 대응 트랙 찾기
             trk = next((t for t in self.tracks if t.det is trk_det), None)
+            if trk is None:
+                continue
 
-            # Warm-up 중인 트랙은 발행 억제
-            if trk is not None and len(trk.history) < MIN_HISTORY_TO_PUBLISH:
+            # Warm-up 중이면 스킵
+            if len(trk.history) < MIN_HISTORY_TO_PUBLISH:
+                continue
+
+            # 최대 publish 횟수 초과 시 스킵
+            if trk.publish_count >= MAX_PUBLISH_COUNT:
                 continue
 
             x, y, z, _, _ = smoothed
 
-            # ── 탐지 좌표 로그 (항상 출력) ──
-            self.get_logger().info(
-                f"[DET] car{idx} → x={x:.3f}, y={y:.3f}")
-
-            # ── 불법주정차 구역 체크 ──
             if not self._in_illegal_zone(x, y):
                 continue
-
-            # ── 구역 내 차량: 노란색(WARN) 로그 + publish ──
-            self.get_logger().warn(
-                f"\033[33m[PUB] car{idx} IN_ZONE → x={x:.3f}, y={y:.3f}\033[0m")
 
             msg = String()
             msg.data = f"{x:.3f},{y:.3f}"
             self.amr_target_pub.publish(msg)
-            published += 1
+            trk.publish_count += 1
+
+            self.get_logger().warn(
+                f"\033[33m[PUB {trk.publish_count}/{MAX_PUBLISH_COUNT}] "
+                f"car{idx} → x={x:.3f}, y={y:.3f}\033[0m")
 
         self.last_publish_time = now
 
